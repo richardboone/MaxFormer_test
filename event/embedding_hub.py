@@ -1,5 +1,6 @@
 import torch.nn as nn
-from spikingjelly.clock_driven.neuron import MultiStepLIFNode
+# from spikingjelly.clock_driven.neuron import MultiStepLIFNode
+from custom_neuron import LIFSpikeLayer_Cons as MultiStepLIFNode # <--- Alias it so you don't have to change code below
 
 class Embed(nn.Module):
     def __init__(self, in_channels=2, out_channels=256, kernel_size = 3, stride = 1, padding = 1, shortcut= False):

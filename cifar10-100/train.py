@@ -39,10 +39,41 @@ from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy, JsdCro
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
+# --- MONKEY PATCH START: Fix FileExistsError in CheckpointSaver ---
+from timm.utils import CheckpointSaver
+import os
+
+# Save reference to the original method
+_original_save_checkpoint = CheckpointSaver.save_checkpoint
+
+def safe_save_checkpoint(self, epoch, metric=None):
+    # Manually construct the filename (usually 'last.pth.tar')
+    # We use getattr to be safe, defaulting to .pth.tar if extension is missing
+    extension = getattr(self, 'extension', '.pth.tar')
+    last_filename = 'last' + extension
+    
+    last_link_path = os.path.join(self.checkpoint_dir, last_filename)
+    
+    # Force delete if it exists
+    if os.path.lexists(last_link_path):
+        try:
+            os.unlink(last_link_path)
+        except OSError:
+            pass # Ignore if it was already deleted by a race condition
+    
+    # Call the original method now that the destination is clear
+    return _original_save_checkpoint(self, epoch, metric)
+
+# Apply the patch
+CheckpointSaver.save_checkpoint = safe_save_checkpoint
+# --- MONKEY PATCH END ---
+
+
 
 import max_former
 import ms_qkformer
 from max_resnet import max_resnet18
+import custom_neuron
 
 try:
     from apex import amp
@@ -67,6 +98,7 @@ try:
 except ImportError:
     has_wandb = False
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 #os.environ["WANDB_API_KEY"] = ""
 #os.environ["WANDB_MODE"] = "offline"
@@ -303,6 +335,16 @@ parser.add_argument('--torchscript', dest='torchscript', action='store_true',
 parser.add_argument('--log-wandb', action='store_true', default=False,
                     help='log training and validation metrics to wandb')
 
+#Extra consistency parameters
+parser.add_argument('--du-du', type=str, default='complex54', help='Feedback gradient mode')
+parser.add_argument('--dS-du', type=str, default='Gamma', help='Surrogate gradient mode')
+parser.add_argument('--snnbp-alpha', type=float, default=1.0)
+parser.add_argument('--snnbp-beta', type=float, default=1.0)
+parser.add_argument('--snnbp-epsilon', type=float, default=0.1)
+parser.add_argument('--snnbp-p', type=float, default=1.0)
+parser.add_argument('--snnbp-k-dir', type=float, default=1.0)
+parser.add_argument('--snnbp-tau', type=float, default=0.5, help='Decay factor (0.5 ~= tau 2.0)')
+parser.add_argument('--gama', type=float, default=1.0)
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -325,12 +367,13 @@ max_accuracy = 0.0
 def main():
     setup_default_logging()
     args, args_text = _parse_args()
-
+    # Pass args to the custom neuron module
+    custom_neuron.set_global_args(args) # <--- Add this line
     if args.log_wandb:
         if has_wandb:
-                wandb.init(project=args.dataset , 
+                wandb.init(project=args.dataset.split("/")[-1] , 
                         name = args.experiment,
-                        entity="spikingtransformer",
+                        # entity="spikingtransformer",
                         config=args)
 
         else:
@@ -466,9 +509,9 @@ def main():
     dataset_train = create_dataset(
         args.dataset,
         root=args.data_path, split=args.train_split, is_training=True,
-        batch_size=args.batch_size, repeats=args.epoch_repeats)
+        batch_size=args.batch_size, repeats=args.epoch_repeats, download=True)
     dataset_eval = create_dataset(
-        args.dataset, root=args.data_path, split=args.val_split, is_training=False, batch_size=args.batch_size)
+        args.dataset, root=args.data_path, split=args.val_split, is_training=False, batch_size=args.batch_size, download=True)
 
     # setup mixup / cutmix
     collate_fn = None
@@ -623,6 +666,14 @@ def main():
             if saver is not None:
                 # save proper checkpoint with eval metric
                 save_metric = eval_metrics[eval_metric]
+                # +++ ROBUST FIX: Use lexists to catch broken links +++
+                last_save_path = os.path.join(output_dir, 'last.pth.tar')
+                try:
+                    if os.path.lexists(last_save_path):
+                        os.unlink(last_save_path)
+                except OSError as e:
+                    _logger.warning(f"Failed to remove {last_save_path}: {e}")
+                # +++++++++++++++++++++++++++++++++++++++++++++++++++++
                 best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
                 _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
 

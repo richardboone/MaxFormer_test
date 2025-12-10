@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from spikingjelly.clock_driven.neuron import MultiStepLIFNode
+# from spikingjelly.clock_driven.neuron import MultiStepLIFNode
+from custom_neuron import LIFSpikeLayer_Cons as MultiStepLIFNode # <--- Alias it so you don't have to change code below
 # from neuron import MultiStepNegIFNode
 from timm.models.layers import trunc_normal_
 from timm.models.registry import register_model
@@ -44,7 +45,7 @@ class Max_Former(nn.Module):
         setattr(self, f"stage1", stage1)
         setattr(self, f"stage2", stage2)
         
-        self.head_lif = MultiStepLIFNode(tau=2.0, detach_reset=True)
+        self.head_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
 
         # classification head
         self.head = nn.Linear(embed_dims, num_classes) if num_classes > 0 else nn.Identity()

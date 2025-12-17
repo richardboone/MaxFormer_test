@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from spikingjelly.clock_driven.neuron import MultiStepLIFNode
+# from spikingjelly.clock_driven.neuron import MultiStepLIFNode
+from custom_neuron import LIFSpikeLayer_Cons as MultiStepLIFNode # <--- Alias it so you don't have to change code below
 
 class S_MLP(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None):

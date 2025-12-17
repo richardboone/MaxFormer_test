@@ -98,7 +98,7 @@ try:
 except ImportError:
     has_wandb = False
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 
 #os.environ["WANDB_API_KEY"] = ""
 #os.environ["WANDB_MODE"] = "offline"
@@ -341,7 +341,7 @@ parser.add_argument('--dS-du', type=str, default='Gamma', help='Surrogate gradie
 parser.add_argument('--snnbp-alpha', type=float, default=1.0)
 parser.add_argument('--snnbp-beta', type=float, default=1.0)
 parser.add_argument('--snnbp-epsilon', type=float, default=0.1)
-parser.add_argument('--snnbp-p', type=float, default=1.0)
+parser.add_argument('--snnbp-p', type=float, default=4.0)
 parser.add_argument('--snnbp-k-dir', type=float, default=1.0)
 parser.add_argument('--snnbp-tau', type=float, default=0.5, help='Decay factor (0.5 ~= tau 2.0)')
 parser.add_argument('--gama', type=float, default=1.0)
@@ -375,6 +375,10 @@ def main():
                         name = args.experiment,
                         # entity="spikingtransformer",
                         config=args)
+                # Append unique Run ID to experiment name to prevent 
+                # multi-agent race conditions on checkpoint files
+                if hasattr(wandb, 'run') and wandb.run is not None:
+                    args.experiment = f"{args.experiment}_{wandb.run.id}"
 
         else:
             _logger.warning("You've requested to log metrics to wandb but package not found. "
@@ -609,9 +613,25 @@ def main():
             ])
         output_dir = get_outdir(args.output if args.output else './output/train', exp_name)
         decreasing = True if eval_metric == 'loss' else False
+        import uuid
+        unique_id = str(uuid.uuid4())[:8]
+        # This forces the saver to use 'last_<random>.pth.tar' instead of just 'last.pth.tar'
+        # Note: We can't easily change the hardcoded 'last.pth.tar' inside timm 0.6.12 without
+        # this trick or the previous monkey patch.
+        # Ideally, we just disable the recovery link creation if possible, or randomize the folder.
+        
+        # Since timm 0.6.12 is strict, the best way to "randomize from the start" 
+        # without patching is actually ensuring output_dir is unique (which you did with the date).
+        # But if that failed, we can explicitly force the saver to NOT create the symlink
+        # by passing unwrap_fn=None (if supported) or just relying on unique folders.
+        
+        # However, to specifically randomize the FILE name as requested:
         saver = CheckpointSaver(
             model=model, optimizer=optimizer, args=args, model_ema=model_ema, amp_scaler=loss_scaler,
             checkpoint_dir=output_dir, recovery_dir=output_dir, decreasing=decreasing, max_history=args.checkpoint_hist)
+        
+        # HACK: Manually override the internal filename attribute after init
+        saver.last_filename = f'last_{unique_id}.pth.tar'
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 

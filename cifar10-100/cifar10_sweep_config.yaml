@@ -1,0 +1,43 @@
+method: bayes
+program: train.py
+metric:
+  goal: maximize
+  name: val/max
+name: complex54_fixed_test
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - "--log-wandb"  # <--- Triggers the store_true flag
+  - ${args}
+parameters:
+  data-path:
+    value: /data/rboone/datasets/cifar10/
+  dS-du:
+    value: Gamma
+  du-du:
+    value: complex54
+  experiment:
+    value: "cifar10_sweep_complex54"
+  model:
+    value: "ms_qkformer"
+  config:
+    value: ./cifar10_sweepcfile.yaml
+  epochs:
+    value: 50
+  snnbp-alpha:
+    distribution: log_uniform_values
+    max: 1000
+    min: 0.001
+  snnbp-beta:
+    distribution: log_uniform_values
+    max: 1000
+    min: 0.001
+  snnbp-epsilon:
+    distribution: log_uniform_values
+    max: 1000
+    min: 0.001
+  snnbp-p:
+    distribution: log_uniform_values
+    max: 1000
+    min: 0.001

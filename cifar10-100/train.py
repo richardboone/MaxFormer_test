@@ -98,7 +98,7 @@ try:
 except ImportError:
     has_wandb = False
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 
 #os.environ["WANDB_API_KEY"] = ""
 #os.environ["WANDB_MODE"] = "offline"

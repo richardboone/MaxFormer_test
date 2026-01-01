@@ -233,7 +233,7 @@ def main(args):
     if global_rank == 0 and args.log_dir is not None and not args.eval:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.log_dir)
-        wandb.init(entity='spikingtransformer', project="nips_img", name=args.exp, config=args)
+        wandb.init(project="maxformer_imagenet", name=args.exp, config=args)
     else:
         log_writer = None
 

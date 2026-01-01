@@ -12,7 +12,7 @@ def set_global_args(args):
 # --- Custom Autograd Function ---
 class TimeParallel_LIFSpike(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, thresh, decay, input_scale, gama, args):
+    def forward(ctx, x, thresh, decay, input_scale, gama, args, detach_reset):
         # SpikingJelly Standard: [Time, Batch, *Spatial]
         T, batch_size, *spatial_dims = x.shape
         device = x.device
@@ -37,29 +37,31 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
             
             # Soft Reset
             mem = mem_before_spike * (1 - spike)
-            mems_after_spikes.append(mem)
+            # mems_after_spikes.append(mem)
         
         # Stack along dimension 0 (Time)
         mem_before_spikes = torch.stack(mem_before_spikes, dim=0)
         spikes_tensor = torch.stack(spikes, dim=0)
-        mems_after_spikes = torch.stack(mems_after_spikes, dim=0)
+        # mems_after_spikes = torch.stack(mems_after_spikes, dim=0)
         
         # Save context
-        ctx.save_for_backward(mem_before_spikes, spikes_tensor, mems_after_spikes, x, torch.tensor([gama]))
+        ctx.save_for_backward(mem_before_spikes, spikes_tensor, x, torch.tensor([gama]))
         ctx.thresh = thresh
         ctx.decay = decay
         ctx.input_scale = input_scale
         ctx.args = args
+        ctx.detach_reset = detach_reset 
         
         return spikes_tensor
 
     @staticmethod
     def backward(ctx, grad_output):
-        mem_before_spikes, spikes_tensor, mems_after_spikes, x, gama = ctx.saved_tensors
+        mem_before_spikes, spikes_tensor, x, gama = ctx.saved_tensors
         thresh = ctx.thresh
         decay = ctx.decay
         input_scale = ctx.input_scale
         args = ctx.args
+        detach_reset = ctx.detach_reset
         
         # Output Gradients
         grad_x = torch.zeros_like(grad_output)
@@ -70,11 +72,17 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
         # Helper for Surrogate Gradient (dS/dU)
         def get_dS_dU1(u, thresh, gama, args):
             mode = getattr(args, 'dS_du', 'Gamma')
-            if mode == "Gamma":
+            if mode == "sigmoid":
+                # SpikingJelly default alpha is often 4.0
+                alpha = getattr(args, 'surrogate_alpha', 4.0) 
+                sgax = (u - thresh) * alpha
+                return (1.0 - torch.sigmoid(sgax)) * torch.sigmoid(sgax) * alpha
+                
+            elif mode == "Gamma":
+                # Standard triangular surrogate
                 return (1 / gama.item()**2) * (gama.item() - (u - thresh).abs()).clamp(min=0)
-            elif mode == "sigmoid":
-                s = torch.sigmoid(u - thresh)
-                return s * (1 - s)
+            
+            # Default fallback
             return (1 / gama.item()**2) * (gama.item() - (u - thresh).abs()).clamp(min=0)
 
         # Backward Time Loop (Iterate T from end to start)
@@ -87,6 +95,13 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
             # --- CUSTOM GRADIENT LOGIC ---
             mode = getattr(args, 'du_du', 'complex54')
             
+            if detach_reset:
+                # Reset gradient is just (1 - S)
+                dU2_dU1_standard = (1 - spikes_tensor[t])
+            else:
+                # Full gradient: (1 - S) - U * dS/dU
+                dU2_dU1_standard = (1 - spikes_tensor[t]) - (u1 * dS_dU1)
+
             if mode == "complex54":
                 epsilon = getattr(args, 'snnbp_epsilon', 0.1)
                 alpha = getattr(args, 'snnbp_alpha', 1.0)
@@ -152,6 +167,9 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 # Final Gradient
                 compute_dist = torch.max(delta.abs(), epsilon * torch.ones_like(delta))
                 dL_dU1 = f * (m_grad / (compute_dist)) + (1 - f) * base_function
+            elif mode == "":
+                print("not ready")
+                exit()
 
                 
             elif mode == "TET":
@@ -170,34 +188,26 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
             # dL/dx[t] = dL/dMem[t] * input_scale
             grad_x[t] = grad_memb_last * input_scale
 
-        return grad_x, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None
 
-# --- Native Drop-in Replacement ---
+## --- Native Drop-in Replacement ---
 class LIFSpikeLayer_Cons(nn.Module):
-    def __init__(self, thresh=1.0, tau=2.0, gama=1.0, args=None, **kwargs):
+    def __init__(self, thresh=1.0, tau=2.0, gama=1.0, detach_reset=True, args=None, **kwargs):
         super(LIFSpikeLayer_Cons, self).__init__()
         self.thresh = thresh
+        self.detach_reset = detach_reset # <--- Capture this arg
         
-        # 1. Grab Args
         self.args = args if args is not None else GLOBAL_ARGS
         
-        # 2. Determine Decay Factor
-        # If user overrides via args (e.g., --snnbp-tau 0.5), use that directly as decay
-        # Otherwise, calculate decay from tau (time constant)
         if self.args and hasattr(self.args, 'snnbp_tau') and self.args.snnbp_tau is not None:
-            print("valid snnbp tau value", self.args.snnbp_tau)
-            # Assume user provided explicit decay factor
             self.decay = self.args.snnbp_tau
-            self.input_scale = 1.0 - self.decay # Input scale is 1 - decay
+            self.input_scale = 1.0 - self.decay
         else:
-            # Standard SpikingJelly behavior: decay = 1 - 1/tau
-            # Input is scaled by 1/tau
             self.decay = 1.0 - (1.0 / tau)
             self.input_scale = 1.0 / tau
-        
-        print(self.args.du_du)
+            
         self.gama = gama
 
     def forward(self, x):
-        # x is [Time, Batch, ...]
-        return TimeParallel_LIFSpike.apply(x, self.thresh, self.decay, self.input_scale, self.gama, self.args)
+        # Pass detach_reset to the function
+        return TimeParallel_LIFSpike.apply(x, self.thresh, self.decay, self.input_scale, self.gama, self.args, self.detach_reset)

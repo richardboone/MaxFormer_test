@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
-from spikingjelly.clock_driven.neuron import MultiStepLIFNode
-# from custom_neuron import LIFSpikeLayer_Cons as MultiStepLIFNode # <--- Alias it so you don't have to change code below
-# from neuron import MultiStepNegIFNode
+from custom_neuron import MultiStepLIFNode # <--- Now using the wrapper
 from timm.models.layers import trunc_normal_
 from timm.models.registry import register_model
 from timm.models.vision_transformer import _cfg

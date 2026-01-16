@@ -98,7 +98,7 @@ try:
 except ImportError:
     has_wandb = False
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "6"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 #os.environ["WANDB_API_KEY"] = ""
 #os.environ["WANDB_MODE"] = "offline"
@@ -338,13 +338,14 @@ parser.add_argument('--log-wandb', action='store_true', default=False,
 #Extra consistency parameters
 parser.add_argument('--du-du', type=str, default='complex54', help='Feedback gradient mode')
 parser.add_argument('--dS-du', type=str, default='Gamma', help='Surrogate gradient mode')
-parser.add_argument('--snnbp-alpha', type=float, default=1.0)
-parser.add_argument('--snnbp-beta', type=float, default=1.0)
-parser.add_argument('--snnbp-epsilon', type=float, default=0.1)
-parser.add_argument('--snnbp-p', type=float, default=4.0)
+parser.add_argument('--snnbp-alpha', type=float, default=1.1742)
+parser.add_argument('--snnbp-beta', type=float, default=0.9245)
+parser.add_argument('--snnbp-epsilon', type=float, default=0.3468)
+parser.add_argument('--snnbp-p', type=float, default=9.5334)
 parser.add_argument('--snnbp-k-dir', type=float, default=1.0)
 parser.add_argument('--snnbp-tau', type=float, default=0.5, help='Decay factor (0.5 ~= tau 2.0)')
 parser.add_argument('--gama', type=float, default=1.0)
+parser.add_argument('--use-custom-neuron', action='store_true', default=True, help='Use custom neuron implementation')
 
 def _parse_args():
     # Do we have a config file to parse?

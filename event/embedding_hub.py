@@ -1,6 +1,5 @@
 import torch.nn as nn
-from spikingjelly.clock_driven.neuron import MultiStepLIFNode
-# from custom_neuron import LIFSpikeLayer_Cons as MultiStepLIFNode # <--- Alias it so you don't have to change code below
+from custom_neuron import MultiStepLIFNode # <--- Now using the wrapper
 
 class Embed(nn.Module):
     def __init__(self, in_channels=2, out_channels=256, kernel_size = 3, stride = 1, padding = 1, shortcut= False):
@@ -11,17 +10,21 @@ class Embed(nn.Module):
         self.embed_bn = nn.BatchNorm2d(out_channels)
         self.shortcut = shortcut
 
-    def forward(self, x):
+    def forward(self, x, dual = False):
         #input : T, B, C, H, W
 
         if self.shortcut is False:
             x = self.embed_lif(x)
 
+        x_feat = x
         x = self.embed_conv(x.flatten(0, 1).contiguous())
         x = self.embed_bn(x)
         
+        if dual:
+            return x, x_feat
         #output : T*B, C, H, W
-        return x
+        else:
+            return x
 
 
 class Max_Embed(nn.Module):
@@ -35,7 +38,7 @@ class Max_Embed(nn.Module):
 
         self.shortcut = shortcut
 
-    def forward(self, x):
+    def forward(self, x, dual = False):
         #input : T, B, C, H, W
 
         if self.shortcut is False:
@@ -46,8 +49,11 @@ class Max_Embed(nn.Module):
         x = self.embed_bn(x)
         x = self.maxpool(x)
 
+        if dual:
+            return x, x_feat
         #output : T*B, C, H, W
-        return x, x_feat
+        else:
+            return x
     
 class Avg_Embed(nn.Module):
     def __init__(self, in_channels=2, out_channels=256, kernel_size = 3, stride = 1, padding = 1, shortcut= False):
@@ -130,13 +136,13 @@ class Embed_Max(nn.Module):
     def forward(self, x):
         T, B, C, H, W = x.shape #T, B, C, H, W
 
-        x, x_feat = self.max_embed1(x)
+        x, x_feat = self.max_embed1(x, dual = True)
         x = x.reshape(T, B, -1, H//2, W//2).contiguous() #T, B, 2C, H//2, W/2
         
         x = self.embed1(x)
 
         #shortcut path
-        x_feat, _= self.max_embed2(x_feat) #input must be spiking signals when shortcut is True
+        x_feat, _= self.max_embed2(x_feat, dual = True) #input must be spiking signals when shortcut is True
         
         x = (x + x_feat).reshape(T, B, -1, H//2, W//2).contiguous() # membrane shortcut
 
@@ -162,13 +168,13 @@ class Embed_Max_plus(nn.Module): # for neuromorphic datasets with input size of 
         x = self.proj_conv(x.flatten(0, 1).contiguous())
         x = self.proj_bn(x).reshape(T, B, -1, H, W) #T, B, C //8, H//2, W/2
 
-        x, _ = self.max_embed1(x)
+        x, _ = self.max_embed1(x, dual = True)
         x = x.reshape(T, B, -1, H//2, W//2).contiguous() #T, B, C //4, H//2, W/2
         
-        x, x_feat = self.max_embed2(x)
+        x, x_feat = self.max_embed2(x, dual = True)
         x = x.reshape(T, B, -1, H//4, W//4).contiguous() #T, B, C //2, H//4, W/4
 
-        x, _= self.max_embed3(x) # #T * B, C, H//8, W/8
+        x, _= self.max_embed3(x, dual = True) # #T * B, C, H//8, W/8
 
         #shortcut
         x_feat = self.embed1(x_feat) #input must be spiking signals when shortcut is True
@@ -188,12 +194,12 @@ class Embed_Avg(nn.Module):
     def forward(self, x):
         T, B, C, H, W = x.shape #T, B, C, H, W
 
-        x, x_feat = self.avg_embed1(x)
+        x, x_feat = self.avg_embed1(x) # No dual for Avg_Embed as it wasn't modified
         x = x.reshape(T, B, -1, H//2, W//2).contiguous() #T, B, 2C, H//2, W/2
         
         x = self.embed1(x)
 
-        x_feat, _= self.avg_embed2(x_feat) #input must be spiking signals when shortcut is True
+        x_feat, _= self.avg_embed2(x_feat) # No dual for Avg_Embed as it wasn't modified
         
         x = (x + x_feat).reshape(T, B, -1, H//2, W//2).contiguous() # membrane shortcut
 

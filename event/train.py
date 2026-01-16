@@ -12,6 +12,7 @@ from torch.cuda import amp
 import utils
 import max_former
 import ms_qkformer
+import custom_neuron
 
 from spikingjelly.clock_driven import functional
 from spikingjelly.datasets import cifar10_dvs
@@ -145,6 +146,18 @@ def parse_args():
 
     parser.add_argument('--dim', type=int, default=None, metavar='N',
                         help='embedding dimsension of feature')
+
+    #Extra consistency parameters
+    parser.add_argument('--du-du', type=str, default='complex54', help='Feedback gradient mode')
+    parser.add_argument('--dS-du', type=str, default='Gamma', help='Surrogate gradient mode')
+    parser.add_argument('--snnbp-alpha', type=float, default=1.1742)
+    parser.add_argument('--snnbp-beta', type=float, default=0.9245)
+    parser.add_argument('--snnbp-epsilon', type=float, default=0.3468)
+    parser.add_argument('--snnbp-p', type=float, default=9.5334)
+    parser.add_argument('--snnbp-k-dir', type=float, default=1.0)
+    parser.add_argument('--snnbp-tau', type=float, default=0.5, help='Decay factor (0.5 ~= tau 2.0)')
+    parser.add_argument('--gama', type=float, default=1.0)
+    parser.add_argument('--use-custom-neuron', action='store_true', default=True, help='Use custom neuron implementation')
 
     args_config, remaining = config_parser.parse_known_args()
     if args_config.config:
@@ -329,11 +342,12 @@ def load_data(dataset, dataset_dir, distributed, T):
 
 
 def main(args):
+    # Pass args to the custom neuron module
+    custom_neuron.set_global_args(args)
     if args.log_wandb:
         if has_wandb:
-                wandb.init(project=args.dataset, 
+                wandb.init(project="maxformer_event", 
                         name = args.experiment,
-                        entity="spikingtransformer",
                         config=args)
 
         else:

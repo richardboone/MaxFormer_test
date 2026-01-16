@@ -295,7 +295,7 @@ def main(args):
             load_checkpoint(model_ema.module, args.resume, use_ema=True)
             
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
         model_without_ddp = model.module
 
     # build optimizer with layer-wise lr decay (lrd)

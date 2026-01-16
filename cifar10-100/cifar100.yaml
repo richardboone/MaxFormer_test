@@ -49,3 +49,5 @@ opt: adamw
 smoothing: 0.1
 workers: 4
 seed: 50425
+
+use_custom_neuron: True

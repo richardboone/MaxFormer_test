@@ -18,7 +18,7 @@ parameters:
   du-du:
     value: complex54
   experiment:
-    value: "event_sweep_complex54"
+    value: "event_sweep_complex54_1_18"
   model:
     value: "max_former"
   config:
@@ -27,11 +27,11 @@ parameters:
     value: 50
   snnbp-alpha:
     distribution: log_uniform_values
-    max: 10.0
+    max: 100.0
     min: 0.1
   snnbp-beta:
     distribution: log_uniform_values
-    max: 10.0
+    max: 100.0
     min: 0.1
   snnbp-epsilon:
     distribution: log_uniform_values
@@ -39,15 +39,13 @@ parameters:
     min: 0.05
   snnbp-p:
     distribution: log_uniform_values
-    max: 20.0
+    max: 50.0
     min: 1.0
   snnbp-tau:
-    distribution: uniform
-    max: 0.9
-    min: 0.1
+    value: 0.5
   lr:
     distribution: log_uniform_values
-    max: 0.005
+    max: 0.05
     min: 0.0001
   weight-decay:
     distribution: log_uniform_values

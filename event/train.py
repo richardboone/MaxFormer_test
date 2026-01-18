@@ -158,6 +158,8 @@ def parse_args():
     parser.add_argument('--snnbp-tau', type=float, default=0.5, help='Decay factor (0.5 ~= tau 2.0)')
     parser.add_argument('--gama', type=float, default=1.0)
     parser.add_argument('--use-custom-neuron', action='store_true', default=True, help='Use custom neuron implementation')
+    parser.add_argument('--early-stop-patience', default=15, type=int, 
+                        help='epochs with no improvement after which training will be stopped. -1 to disable.')
 
     args_config, remaining = config_parser.parse_known_args()
     if args_config.config:
@@ -464,6 +466,9 @@ def main(args):
         mixup_fn = Mixup(**mixup_args)
     print("Start training")
     start_time = time.time()
+
+    patience_counter = 0 # for early stopping
+    print(f"Early stopping enabled. Patience: {args.early_stop_patience} epochs.")
     for epoch in range(args.start_epoch, num_epochs):
         save_max = False
         if args.distributed:
@@ -482,6 +487,9 @@ def main(args):
             max_test_acc1 = test_acc1
             test_acc5_at_max_test_acc1 = test_acc5
             save_max = True
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
         if args.log_wandb and has_wandb:
             wandb.log({
@@ -511,6 +519,11 @@ def main(args):
                 utils.save_on_master(
                     checkpoint,
                     os.path.join(output_dir, 'checkpoint_max_test_acc1.pth'))
+        if args.early_stop_patience > 0 and patience_counter >= args.early_stop_patience:
+            if utils.is_main_process():
+                print(f'\nEarly stopping triggered! No improvement for {args.early_stop_patience} epochs.')
+                print(f'Best Acc: {max_test_acc1} at epoch {epoch - patience_counter}')
+            break
         print(args)
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))

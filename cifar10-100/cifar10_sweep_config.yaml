@@ -20,24 +20,36 @@ parameters:
   experiment:
     value: "cifar10_sweep_complex54"
   model:
-    value: "ms_qkformer"
+    value: "max_former"
   config:
     value: ./cifar10_sweepcfile.yaml
   epochs:
     value: 50
+  lr:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 5e-3
+  weight-decay:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 1e-1
   snnbp-alpha:
     distribution: log_uniform_values
-    max: 1000
-    min: 0.001
+    min: 0.1
+    max: 20.0
   snnbp-beta:
     distribution: log_uniform_values
-    max: 1000
-    min: 0.001
+    min: 0.1
+    max: 20.0
   snnbp-epsilon:
     distribution: log_uniform_values
-    max: 1000
-    min: 0.001
+    min: 0.01
+    max: 0.5
   snnbp-p:
-    distribution: log_uniform_values
-    max: 1000
-    min: 0.001
+    distribution: uniform
+    min: 0.5
+    max: 10.0
+early_terminate:
+  type: hyperband
+  min_iter: 15
+  eta: 3

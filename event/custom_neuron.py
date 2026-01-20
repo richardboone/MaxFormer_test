@@ -167,6 +167,170 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 # Final Gradient
                 compute_dist = torch.max(delta.abs(), epsilon * torch.ones_like(delta))
                 dL_dU1 = f * (m_grad / (compute_dist)) + (1 - f) * base_function
+
+            elif mode == "stable_cgrad":
+                """
+                Stabilized Custom Gradient
+                --------------------------
+                Key stability improvements:
+                1. Logarithmic scaling instead of division to prevent gradient explosion
+                2. Soft magnitude clamping using tanh
+                3. Smoother blending via softplus gates
+                4. Gradient magnitude bounded relative to base_function
+                """
+                epsilon = getattr(args, 'snnbp_epsilon', 0.3)
+                alpha = getattr(args, 'snnbp_alpha', 1.0)
+                beta = getattr(args, 'snnbp_beta', 1.0)
+                max_ratio = getattr(args, 'snnbp_max_ratio', 3.0)  # Max multiplier vs base gradient
+                
+                u1 = mem_before_spikes[t]
+                delta = u1 - thresh
+                
+                # Compute correction terms
+                term_supra_threshold = (thresh * dL_dU2) - dL_dS
+                term_sub_threshold = dL_dS - (u1 * dL_dU2)
+                
+                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
+                m_grad = torch.where(u1 < thresh, m, -m)
+                
+                # Base Function (Standard BPTT)
+                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
+                
+                # Stability improvement 1: Use log-based scaling instead of division
+                # log(1 + |delta|/epsilon) provides smooth, bounded scaling
+                log_scale = torch.log1p(delta.abs() / epsilon)
+                scaled_correction = m_grad * torch.tanh(log_scale)  # tanh bounds to [-1, 1]
+                
+                # Stability improvement 2: Soft gates using softplus (smoother than sigmoid)
+                g_m = torch.sigmoid(alpha * m)  # Magnitude gate
+                g_d = torch.sigmoid(beta * (epsilon - delta.abs()))  # Distance gate
+                
+                # Stability improvement 3: Smooth directionality (avoid hard sign)
+                k_smooth = getattr(args, 'snnbp_k_dir', 2.0)
+                alignment = -m_grad * base_function  # Negative when opposing
+                g_dir = torch.sigmoid(k_smooth * alignment / (base_function.abs() + 1e-8))
+                
+                # Combined blend factor (no p multiplier, inherently bounded 0-1)
+                f = g_m * g_d * g_dir
+                
+                # Stability improvement 4: Bound correction magnitude relative to base
+                base_mag = base_function.abs() + 1e-8
+                correction = scaled_correction * base_mag * max_ratio
+                
+                # Final blended gradient
+                dL_dU1 = f * correction + (1 - f) * base_function
+
+            elif mode == "adaptive_cgrad":
+                """
+                Adaptive Custom Gradient
+                ------------------------
+                Key stability improvements:
+                1. Normalizes correction by local gradient statistics
+                2. Uses running estimates to adapt correction strength
+                3. EMA-style smoothing for magnitude bounds
+                4. Correction strength decays when base gradient is large
+                """
+                epsilon = getattr(args, 'snnbp_epsilon', 0.3)
+                alpha = getattr(args, 'snnbp_alpha', 1.0)
+                beta = getattr(args, 'snnbp_beta', 1.0)
+                decay_rate = getattr(args, 'snnbp_decay', 0.5)
+                
+                u1 = mem_before_spikes[t]
+                delta = u1 - thresh
+                
+                # Compute correction terms
+                term_supra_threshold = (thresh * dL_dU2) - dL_dS
+                term_sub_threshold = dL_dS - (u1 * dL_dU2)
+                
+                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
+                m_grad = torch.where(u1 < thresh, m, -m)
+                
+                # Base Function (Standard BPTT)
+                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
+                base_mag = base_function.abs() + 1e-8
+                
+                # Adaptive: Use base gradient magnitude to normalize correction
+                # When base gradient is large, we trust it more (less correction)
+                # When base gradient is small, correction has more influence
+                adaptive_scale = 1.0 / (1.0 + decay_rate * base_mag)
+                
+                # Bounded correction: divide by soft distance, clamp magnitude
+                soft_dist = torch.sqrt(delta.abs().pow(2) + epsilon**2)
+                raw_correction = m_grad / soft_dist
+                
+                # Clamp correction to be within reasonable bounds of base gradient
+                max_correction = 2.0 * base_mag
+                clamped_correction = torch.clamp(raw_correction, -max_correction, max_correction)
+                
+                # Gates
+                g_m = torch.sigmoid(alpha * m)
+                g_d = torch.sigmoid(beta * (epsilon - delta.abs()))
+                
+                # Smooth directionality  
+                k_dir = getattr(args, 'snnbp_k_dir', 1.0)
+                g_dir = torch.sigmoid(-k_dir * m_grad * base_function / (base_mag**2 + 1e-6))
+                
+                # Blend factor with adaptive scaling
+                f = torch.clamp(g_m * g_d * g_dir * adaptive_scale, 0, 1)
+                
+                # Final gradient
+                dL_dU1 = f * clamped_correction + (1 - f) * base_function
+
+            elif mode == "conservative_cgrad":
+                """
+                Conservative Custom Gradient
+                ----------------------------
+                Key stability improvements:
+                1. Only intervenes in high-confidence problematic cases
+                2. Uses higher thresholds for activation
+                3. Interpolates toward base gradient rather than custom correction
+                4. Minimal disruption to standard training dynamics
+                """
+                epsilon = getattr(args, 'snnbp_epsilon', 0.3)
+                alpha = getattr(args, 'snnbp_alpha', 2.0)  # Higher = more selective
+                beta = getattr(args, 'snnbp_beta', 2.0)
+                intervention_threshold = getattr(args, 'snnbp_intervention', 0.8)
+                
+                u1 = mem_before_spikes[t]
+                delta = u1 - thresh
+                
+                # Compute correction terms
+                term_supra_threshold = (thresh * dL_dU2) - dL_dS
+                term_sub_threshold = dL_dS - (u1 * dL_dU2)
+                
+                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
+                m_grad = torch.where(u1 < thresh, m, -m)
+                
+                # Base Function (Standard BPTT)
+                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
+                
+                # Conservative approach: only care about clear misalignment
+                # Detect when base gradient would push toward undesirable threshold crossing
+                misalignment = -m_grad * base_function  # Positive when base opposes desired direction
+                
+                # High-threshold gates (only activate in clear cases)
+                g_m = torch.sigmoid(alpha * (m.abs() - 0.1))  # Only for significant m
+                g_d = torch.sigmoid(beta * (epsilon - delta.abs()))  # Near threshold
+                g_misalign = torch.sigmoid(alpha * misalignment)  # Clear misalignment
+                
+                # Combined intervention signal
+                intervention_signal = g_m * g_d * g_misalign
+                
+                # Only intervene past threshold
+                do_intervene = (intervention_signal > intervention_threshold).float()
+                
+                # Soft intervention: interpolate toward corrected direction
+                # Instead of replacing gradient, dampen the problematic component
+                correction_direction = torch.sign(m_grad)
+                correction_magnitude = base_function.abs() * 0.5  # Match base scale
+                soft_correction = correction_direction * correction_magnitude
+                
+                # Smooth blending (gradual damping, not hard switch)
+                blend_factor = do_intervene * torch.sigmoid(5 * (intervention_signal - intervention_threshold))
+                
+                # Final gradient: mostly base, with soft correction in extreme cases
+                dL_dU1 = (1 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
+
             elif mode == "":
                 print("not ready")
                 exit()

@@ -350,6 +350,8 @@ parser.add_argument('--snnbp-decay', type=float, default=0.5, help='adaptive_cgr
 parser.add_argument('--snnbp-intervention', type=float, default=0.8, help='conservative_cgrad: confidence threshold for intervention')
 parser.add_argument('--gama', type=float, default=1.0)
 parser.add_argument('--use-custom-neuron', action='store_true', default=True, help='Use custom neuron implementation')
+parser.add_argument('--surrogate-alpha', type=float, default=4.0, 
+                    help='Alpha parameter for sigmoid surrogate gradient')
 
 def _parse_args():
     # Do we have a config file to parse?

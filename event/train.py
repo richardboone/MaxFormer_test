@@ -160,6 +160,7 @@ def parse_args():
     parser.add_argument('--snnbp-max-ratio', type=float, default=3.0, help='stable_cgrad: max gradient multiplier vs base')
     parser.add_argument('--snnbp-decay', type=float, default=0.5, help='adaptive_cgrad: trust decay for large base gradients')
     parser.add_argument('--snnbp-intervention', type=float, default=0.8, help='conservative_cgrad: confidence threshold for intervention')
+    parser.add_argument('--surrogate-alpha', type=float, default=4.0, help='Alpha for sigmoid surrogate gradient')
     parser.add_argument('--gama', type=float, default=1.0)
     parser.add_argument('--use-custom-neuron', action='store_true', default=True, help='Use custom neuron implementation')
     parser.add_argument('--early-stop-patience', default=15, type=int, 

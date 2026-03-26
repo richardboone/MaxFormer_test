@@ -5,10 +5,15 @@ from spikingjelly.clock_driven.neuron import MultiStepLIFNode as OriginalLIFNode
 
 # --- Global Args Handler ---
 GLOBAL_ARGS = None
+METRICS_COLLECTOR = None
 
 def set_global_args(args):
     global GLOBAL_ARGS
     GLOBAL_ARGS = args
+
+def set_metrics_collector(collector):
+    global METRICS_COLLECTOR
+    METRICS_COLLECTOR = collector
 
 # --- Custom Autograd Function ---
 class TimeParallel_LIFSpike(torch.autograd.Function):
@@ -88,10 +93,11 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
 
         # Backward Time Loop (Iterate T from end to start)
         for t in reversed(range(x.shape[0])):
+            u1 = mem_before_spikes[t]
             dL_dS = grad_output[t]        # Gradient from loss w.r.t Spike[t]
             dL_dU2 = grad_memb_last * decay # Propagate via decay factor
             
-            dS_dU1 = get_dS_dU1(mem_before_spikes[t], thresh, gama, args)
+            dS_dU1 = get_dS_dU1(u1, thresh, gama, args)
             
             # --- CUSTOM GRADIENT LOGIC ---
             mode = getattr(args, 'du_du', 'complex54')
@@ -109,8 +115,6 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 beta = getattr(args, 'snnbp_beta', 0.9245)
                 p = getattr(args, 'snnbp_p', 9.5334)
 
-                u1 = mem_before_spikes[t]
-                
                 term_supra_threshold = (thresh * dL_dU2) - dL_dS
                 term_sub_threshold = dL_dS - (u1 * dL_dU2)
                 
@@ -142,8 +146,6 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 p = getattr(args, 'snnbp_p', 9.5334)
                 k_dir = getattr(args, 'snnbp_k_dir', 1.0)
 
-                u1 = mem_before_spikes[t]
-                
                 term_supra_threshold = (thresh * dL_dU2) - dL_dS
                 term_sub_threshold = dL_dS - (u1 * dL_dU2)
                 
@@ -183,7 +185,6 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 beta = getattr(args, 'snnbp_beta', 1.0)
                 max_ratio = getattr(args, 'snnbp_max_ratio', 3.0)  # Max multiplier vs base gradient
                 
-                u1 = mem_before_spikes[t]
                 delta = u1 - thresh
                 
                 # Compute correction terms
@@ -235,7 +236,6 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 beta = getattr(args, 'snnbp_beta', 1.0)
                 decay_rate = getattr(args, 'snnbp_decay', 0.5)
                 
-                u1 = mem_before_spikes[t]
                 delta = u1 - thresh
                 
                 # Compute correction terms
@@ -291,7 +291,6 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 beta = getattr(args, 'snnbp_beta', 2.0)
                 intervention_threshold = getattr(args, 'snnbp_intervention', 0.8)
                 
-                u1 = mem_before_spikes[t]
                 delta = u1 - thresh
                 
                 # Compute correction terms
@@ -331,17 +330,10 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 # Final gradient: mostly base, with soft correction in extreme cases
                 dL_dU1 = (1 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
 
-            elif mode == "":
-                print("not ready")
-                exit()
 
-                
-            elif mode == "TET":
-                dU2_dU1 = (1 - spikes_tensor[t]) - (mem_before_spikes[t] * dS_dU1)
-                dL_dU1 = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1
             else:
                 # Default LIF
-                dU2_dU1 = (1 - spikes_tensor[t]) - (mem_before_spikes[t] * dS_dU1)
+                dU2_dU1 = (1 - spikes_tensor[t]) - (u1 * dS_dU1)
                 dL_dU1 = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1
 
             # Update for next iteration
@@ -384,6 +376,11 @@ class MultiStepLIFNode(nn.Module):
         if GLOBAL_ARGS is not None and hasattr(GLOBAL_ARGS, 'use_custom_neuron'):
              use_custom = GLOBAL_ARGS.use_custom_neuron
         
+        # Override detach_reset if set globally
+        real_detach_reset = detach_reset
+        if GLOBAL_ARGS is not None and hasattr(GLOBAL_ARGS, 'detach_reset') and GLOBAL_ARGS.detach_reset is not None:
+            real_detach_reset = GLOBAL_ARGS.detach_reset
+        
         # Check for v_threshold in kwargs (aliasing thresh)
         real_thresh = thresh
         if 'v_threshold' in kwargs:
@@ -391,7 +388,7 @@ class MultiStepLIFNode(nn.Module):
         
         self.impl = None
         if use_custom:
-            self.impl = LIFSpikeLayer_Cons(thresh=real_thresh, tau=tau, gama=gama, detach_reset=detach_reset, args=args, **kwargs)
+            self.impl = LIFSpikeLayer_Cons(thresh=real_thresh, tau=tau, gama=gama, detach_reset=real_detach_reset, args=args, **kwargs)
         else:
             oj_kwargs = kwargs.copy()
             # Ensure v_threshold is set for Original
@@ -403,7 +400,7 @@ class MultiStepLIFNode(nn.Module):
             
             self.impl = OriginalLIFNode(
                 tau=tau, 
-                detach_reset=detach_reset, 
+                detach_reset=real_detach_reset, 
                 **oj_kwargs
             )
             

@@ -325,6 +325,70 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 # Final gradient: mostly base, with soft correction in extreme cases
                 dL_dU1 = (1 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
 
+            elif mode == "conservative_ablate":
+                """
+                Conservative Custom Gradient — Ablation Variant
+                ------------------------------------------------
+                Identical to conservative_cgrad but reads ablation toggles
+                from args to selectively disable individual gates:
+                  - ablation_gm:           enable/disable g_m (magnitude gate)
+                  - ablation_gd:           enable/disable g_d (proximity gate)
+                  - ablation_gmisalign:    enable/disable g_misalign (alignment gate)
+                  - ablation_intervention: enable/disable hard intervention threshold
+                When a gate is OFF it is replaced with 1.0 (always-on),
+                removing its filtering effect.
+                """
+                epsilon = getattr(args, 'snnbp_epsilon', 0.3)
+                alpha = getattr(args, 'snnbp_alpha', 2.0)
+                beta = getattr(args, 'snnbp_beta', 2.0)
+                intervention_threshold = getattr(args, 'snnbp_intervention', 0.8)
+
+                # Ablation toggles (default True = enabled = full method)
+                use_gm = getattr(args, 'ablation_gm', True)
+                use_gd = getattr(args, 'ablation_gd', True)
+                use_gmisalign = getattr(args, 'ablation_gmisalign', True)
+                use_intervention = getattr(args, 'ablation_intervention', True)
+
+                delta = u1 - thresh
+
+                # Compute correction terms
+                term_supra_threshold = (thresh * dL_dU2) - dL_dS
+                term_sub_threshold = dL_dS - (u1 * dL_dU2)
+
+                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
+                m_grad = torch.where(u1 < thresh, m, -m)
+
+                # Base Function (Standard BPTT)
+                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
+
+                # Conservative approach: only care about clear misalignment
+                misalignment = -m_grad * base_function
+
+                # Gates (conditionally ablated)
+                g_m = torch.sigmoid(alpha * (m.abs() - 0.1)) if use_gm else torch.ones_like(m)
+                g_d = torch.sigmoid(beta * (epsilon - delta.abs())) if use_gd else torch.ones_like(delta)
+                g_misalign = torch.sigmoid(alpha * misalignment) if use_gmisalign else torch.ones_like(misalignment)
+
+                # Combined intervention signal
+                intervention_signal = g_m * g_d * g_misalign
+
+                # Only intervene past threshold (or always intervene if ablated)
+                if use_intervention:
+                    do_intervene = (intervention_signal > intervention_threshold).float()
+                else:
+                    do_intervene = torch.ones_like(intervention_signal)
+
+                # Soft intervention: interpolate toward corrected direction
+                correction_direction = torch.sign(m_grad)
+                correction_magnitude = base_function.abs() * 0.5
+                soft_correction = correction_direction * correction_magnitude
+
+                # Smooth blending
+                blend_factor = do_intervene * torch.sigmoid(5 * (intervention_signal - intervention_threshold))
+
+                # Final gradient
+                dL_dU1 = (1 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
+
             elif mode == "":
                 print("not ready")
                 exit()

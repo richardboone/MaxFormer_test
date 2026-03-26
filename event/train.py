@@ -35,6 +35,16 @@ torch.backends.cudnn.enable =True
 
 import numpy as np
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 
 def parse_args():
     import argparse
@@ -162,8 +172,13 @@ def parse_args():
     parser.add_argument('--snnbp-intervention', type=float, default=0.8, help='conservative_cgrad: confidence threshold for intervention')
     parser.add_argument('--gama', type=float, default=1.0)
     parser.add_argument('--use-custom-neuron', action='store_true', default=True, help='Use custom neuron implementation')
-    parser.add_argument('--early-stop-patience', default=15, type=int, 
+    parser.add_argument('--early-stop-patience', default=-1, type=int, 
                         help='epochs with no improvement after which training will be stopped. -1 to disable.')
+    parser.add_argument('--detach-reset', type=str2bool, default=True, help='Detach reset gradient')
+    parser.add_argument('--ablation-gm', type=str2bool, default=True, help='Ablation: enable g_m magnitude gate')
+    parser.add_argument('--ablation-gd', type=str2bool, default=True, help='Ablation: enable g_d proximity gate')
+    parser.add_argument('--ablation-gmisalign', type=str2bool, default=True, help='Ablation: enable g_misalign alignment gate')
+    parser.add_argument('--ablation-intervention', type=str2bool, default=True, help='Ablation: enable hard intervention threshold')
 
     args_config, remaining = config_parser.parse_known_args()
     if args_config.config:

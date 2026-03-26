@@ -1,0 +1,7 @@
+**/__pycache__/
+*.pyc
+
+#Ignore logs and weights
+event/logs
+event/wandb
+

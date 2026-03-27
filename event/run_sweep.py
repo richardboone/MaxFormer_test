@@ -6,6 +6,9 @@ import os
 import sys
 
 # --- Configuration ---
+GPUS_TO_USE = [0,1,2]  # GPUs you are willing to use
+GPU_MEMORY_THRESHOLD_MB = 20000  # Minimum free memory (in MB) to be considered "available"
+MAX_AGENTS_PER_GPU = 1
 GPUS_TO_USE = [0,3]  # GPUs you are willing to use
 GPU_MEMORY_THRESHOLD_MB = 50000  # Minimum free memory (in MB) to be considered "available"
 MAX_AGENTS_PER_GPU = 1

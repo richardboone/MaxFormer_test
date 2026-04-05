@@ -13,7 +13,7 @@ def set_global_args(args):
 # --- Custom Autograd Function ---
 class TimeParallel_LIFSpike(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, thresh, decay, input_scale, gama, args, detach_reset):
+    def forward(ctx, x, thresh, decay, input_scale, gama, args, detach_reset, reset_mode):
         # SpikingJelly Standard: [Time, Batch, *Spatial]
         T, batch_size, *spatial_dims = x.shape
         device = x.device
@@ -36,8 +36,11 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
             spike = (mem_before_spike > thresh).float()
             spikes.append(spike)
             
-            # Soft Reset
-            mem = mem_before_spike * (1 - spike)
+            # Reset
+            if reset_mode == 'soft':
+                mem = mem_before_spike - thresh * spike
+            else:  # 'hard'
+                mem = mem_before_spike * (1 - spike)
             # mems_after_spikes.append(mem)
         
         # Stack along dimension 0 (Time)
@@ -51,7 +54,8 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
         ctx.decay = decay
         ctx.input_scale = input_scale
         ctx.args = args
-        ctx.detach_reset = detach_reset 
+        ctx.detach_reset = detach_reset
+        ctx.reset_mode = reset_mode
         
         return spikes_tensor
 
@@ -63,6 +67,7 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
         input_scale = ctx.input_scale
         args = ctx.args
         detach_reset = ctx.detach_reset
+        reset_mode = ctx.reset_mode
         
         # Output Gradients
         grad_x = torch.zeros_like(grad_output)
@@ -97,12 +102,19 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
             # --- CUSTOM GRADIENT LOGIC ---
             mode = getattr(args, 'du_du', 'complex54')
             
-            if detach_reset:
-                # Reset gradient is just (1 - S)
-                dU2_dU1_standard = (1 - spikes_tensor[t])
-            else:
-                # Full gradient: (1 - S) - U * dS/dU
-                dU2_dU1_standard = (1 - spikes_tensor[t]) - (u1 * dS_dU1)
+            if reset_mode == 'soft':
+                if detach_reset:
+                    dU2_dU1_standard = torch.ones_like(u1)
+                else:
+                    # Full gradient: 1 - V_th * dS/dU
+                    dU2_dU1_standard = 1 - thresh * dS_dU1
+            else:  # 'hard'
+                if detach_reset:
+                    # Reset gradient is just (1 - S)
+                    dU2_dU1_standard = (1 - spikes_tensor[t])
+                else:
+                    # Full gradient: (1 - S) - U * dS/dU
+                    dU2_dU1_standard = (1 - spikes_tensor[t]) - (u1 * dS_dU1)
 
             if mode == "complex54":
                 epsilon = getattr(args, 'snnbp_epsilon', 0.3468)
@@ -110,7 +122,10 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 beta = getattr(args, 'snnbp_beta', 0.9245)
                 p = getattr(args, 'snnbp_p', 9.5334)
 
-                term_supra_threshold = (thresh * dL_dU2) - dL_dS
+                if reset_mode == 'soft':
+                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
+                else:
+                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
                 term_sub_threshold = dL_dS - (u1 * dL_dU2)
                 
                 m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
@@ -141,7 +156,10 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 p = getattr(args, 'snnbp_p', 9.5334)
                 k_dir = getattr(args, 'snnbp_k_dir', 1.0)
 
-                term_supra_threshold = (thresh * dL_dU2) - dL_dS
+                if reset_mode == 'soft':
+                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
+                else:
+                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
                 term_sub_threshold = dL_dS - (u1 * dL_dU2)
                 
                 m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
@@ -183,7 +201,10 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 delta = u1 - thresh
                 
                 # Compute correction terms
-                term_supra_threshold = (thresh * dL_dU2) - dL_dS
+                if reset_mode == 'soft':
+                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
+                else:
+                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
                 term_sub_threshold = dL_dS - (u1 * dL_dU2)
                 
                 m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
@@ -234,7 +255,10 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 delta = u1 - thresh
                 
                 # Compute correction terms
-                term_supra_threshold = (thresh * dL_dU2) - dL_dS
+                if reset_mode == 'soft':
+                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
+                else:
+                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
                 term_sub_threshold = dL_dS - (u1 * dL_dU2)
                 
                 m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
@@ -289,7 +313,10 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 delta = u1 - thresh
                 
                 # Compute correction terms
-                term_supra_threshold = (thresh * dL_dU2) - dL_dS
+                if reset_mode == 'soft':
+                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
+                else:
+                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
                 term_sub_threshold = dL_dS - (u1 * dL_dU2)
                 
                 m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
@@ -352,7 +379,10 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 delta = u1 - thresh
 
                 # Compute correction terms
-                term_supra_threshold = (thresh * dL_dU2) - dL_dS
+                if reset_mode == 'soft':
+                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
+                else:
+                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
                 term_sub_threshold = dL_dS - (u1 * dL_dU2)
 
                 m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
@@ -395,11 +425,17 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
 
                 
             elif mode == "TET":
-                dU2_dU1 = (1 - spikes_tensor[t]) - (u1 * dS_dU1)
+                if reset_mode == 'soft':
+                    dU2_dU1 = 1 - thresh * dS_dU1
+                else:
+                    dU2_dU1 = (1 - spikes_tensor[t]) - (u1 * dS_dU1)
                 dL_dU1 = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1
             else:
                 # Default LIF
-                dU2_dU1 = (1 - spikes_tensor[t]) - (u1 * dS_dU1)
+                if reset_mode == 'soft':
+                    dU2_dU1 = 1 - thresh * dS_dU1
+                else:
+                    dU2_dU1 = (1 - spikes_tensor[t]) - (u1 * dS_dU1)
                 dL_dU1 = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1
 
             # Update for next iteration
@@ -410,7 +446,7 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
             # dL/dx[t] = dL/dMem[t] * input_scale
             grad_x[t] = grad_memb_last * input_scale
 
-        return grad_x, None, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None, None
 
 ## --- Native Drop-in Replacement ---
 class LIFSpikeLayer_Cons(nn.Module):
@@ -420,6 +456,7 @@ class LIFSpikeLayer_Cons(nn.Module):
         self.detach_reset = detach_reset # <--- Capture this arg
         
         self.args = args if args is not None else GLOBAL_ARGS
+        self.reset_mode = getattr(self.args, 'reset_mode', 'hard') if self.args else 'hard'
         
         if self.args and hasattr(self.args, 'snnbp_tau') and self.args.snnbp_tau is not None:
             self.decay = self.args.snnbp_tau
@@ -432,7 +469,7 @@ class LIFSpikeLayer_Cons(nn.Module):
 
     def forward(self, x):
         # Pass detach_reset to the function
-        return TimeParallel_LIFSpike.apply(x, self.thresh, self.decay, self.input_scale, self.gama, self.args, self.detach_reset)
+        return TimeParallel_LIFSpike.apply(x, self.thresh, self.decay, self.input_scale, self.gama, self.args, self.detach_reset, self.reset_mode)
         
 class MultiStepLIFNode(nn.Module):
     def __init__(self, thresh=1.0, tau=2.0, gama=1.0, detach_reset=True, args=None, **kwargs):

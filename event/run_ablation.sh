@@ -7,10 +7,10 @@
 # =============================================================================
 
 # --- Configuration ---
-GPUS=(1 2 3 5)
+GPUS=(0 1 2)
 NUM_GPUS=${#GPUS[@]}
 DATA_PATH="/data/rboone/datasets/wg_dvst"
-CONFIG="./cifar10dvs_cgrad.yaml"
+CONFIG="./cifar10dvs_rebuttal_ablate.yaml"
 DU_DU="conservative_ablate"
 DS_DU="Gamma"
 DRY_RUN=${DRY_RUN:-0}  # Set DRY_RUN=1 to print commands without executing

@@ -14,7 +14,7 @@ device: cuda:0
 dist_url: env://
 distributed: false
 epoch_repeats: 0.0
-epochs: 96
+epochs: 150
 experiment: ''
 flblocks: 16
 log_wandb: false
@@ -51,3 +51,4 @@ warmup_lr: 1.0e-05
 weight_decay: 0.06
 workers: 4
 world_size: 1
+use_custom_neuron: False

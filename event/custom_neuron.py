@@ -352,6 +352,64 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 # Final gradient: mostly base, with soft correction in extreme cases
                 dL_dU1 = (1 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
 
+            elif mode == "conservative_cgrad_2":
+                """
+                Conservative Custom Gradient
+                ----------------------------
+                Key stability improvements:
+                1. Only intervenes in high-confidence problematic cases
+                2. Uses higher thresholds for activation
+                3. Interpolates toward base gradient rather than custom correction
+                4. Minimal disruption to standard training dynamics
+                """
+                epsilon = getattr(args, 'snnbp_epsilon', 0.3)
+                alpha = getattr(args, 'snnbp_alpha', 2.0)  # Higher = more selective
+                beta = getattr(args, 'snnbp_beta', 2.0)
+                p = getattr(args, 'snnbp_p', 0.5)
+                intervention_threshold = getattr(args, 'snnbp_intervention', 0.8)
+                
+                delta = u1 - thresh
+                
+                # Compute correction terms
+                if reset_mode == 'soft':
+                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
+                else:
+                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
+                term_sub_threshold = dL_dS - (u1 * dL_dU2)
+                
+                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
+                m_grad = torch.where(u1 < thresh, m, -m)
+                
+                # Base Function (Standard BPTT)
+                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
+                
+                # Conservative approach: only care about clear misalignment
+                # Detect when base gradient would push toward undesirable threshold crossing
+                misalignment = -m_grad * base_function  # Positive when base opposes desired direction
+                
+                # High-threshold gates (only activate in clear cases)
+                g_m = torch.sigmoid(alpha * (m.abs() - 0.1))  # Only for significant m
+                g_d = torch.sigmoid(beta * (epsilon - delta.abs()))  # Near threshold
+                g_misalign = torch.sigmoid(alpha * misalignment)  # Clear misalignment
+                
+                # Combined intervention signal
+                intervention_signal = g_m * g_d * g_misalign
+                
+                # Only intervene past threshold
+                do_intervene = (intervention_signal > intervention_threshold).float()
+                
+                # Soft intervention: interpolate toward corrected direction
+                # Instead of replacing gradient, dampen the problematic component
+                correction_direction = torch.sign(m_grad)
+                correction_magnitude = base_function.abs() * 0.5  # Match base scale
+                soft_correction = correction_direction * correction_magnitude
+                
+                # Smooth blending (gradual damping, not hard switch)
+                blend_factor = do_intervene * torch.sigmoid(5 * (intervention_signal - intervention_threshold))
+                
+                # Final gradient: mostly base, with soft correction in extreme cases
+                dL_dU1 = (1 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
+
             elif mode == "conservative_ablate":
                 """
                 Conservative Custom Gradient — Ablation Variant

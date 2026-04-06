@@ -178,6 +178,8 @@ def parse_args():
     parser.add_argument('--early-stop-patience', default=-1, type=int, 
                         help='epochs with no improvement after which training will be stopped. -1 to disable.')
     parser.add_argument('--detach-reset', type=str2bool, default=True, help='Detach reset gradient')
+    parser.add_argument('--reset-mode', type=str, default='hard', choices=['hard', 'soft'],
+                        help='LIF neuron reset mode: hard (multiply by 1-S) or soft (subtract V_th*S)')
     parser.add_argument('--ablation-gm', type=str2bool, default=True, help='Ablation: enable g_m magnitude gate')
     parser.add_argument('--ablation-gd', type=str2bool, default=True, help='Ablation: enable g_d proximity gate')
     parser.add_argument('--ablation-gmisalign', type=str2bool, default=True, help='Ablation: enable g_misalign alignment gate')

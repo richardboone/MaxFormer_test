@@ -51,15 +51,16 @@ warmup_lr: 1.0e-05
 weight_decay: 0.0079
 workers: 4
 world_size: 1
-snnbp_alpha: 3.11
-snnbp_beta: 1.21
-snnbp_epsilon: 0.17
-snnbp_intervention: 0.24
+
+dS_du: Gamma
+du_du: TET
+snnbp_alpha: 2.01
+snnbp_beta: 4.06
+snnbp_epsilon: 0.437
+snnbp_intervention: 0.562
 snnbp_p: 9.53
 snnbp_tau: 0.5
 use_custom_neuron: true
+reset_mode: soft
 detach_reset: true
-du_du: conservative_cgrad
 
-
-#  --lr=0.0018644529172224477 --model=max_former --snnbp-alpha=0.14948468470247225 --snnbp-beta=0.6766479520668023 --snnbp-epsilon=0.9604218268449634 --snnbp-p=47.87984762060856 --snnbp-tau=0.5 --weight-decay=0.007929990072129916

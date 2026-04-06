@@ -1,0 +1,72 @@
+method: bayes
+program: train.py
+metric:
+  goal: maximize
+  name: val/max
+name: event_soft_cgrad_sweep
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - "--log-wandb"
+  - ${args}
+
+parameters:
+  # Base configuration and dataset
+  config:
+    value: ./cifar10dvs_cgrad_soft.yaml
+  data-path:
+    value: /data/rboone/datasets/wg_dvst
+  dataset:
+    value: cifar10dvs
+  experiment:
+    value: "event_soft_cgrad_sweep"
+  model:
+    value: "max_former"
+  epochs:
+    value: 96
+  
+  # Non-swept parameters explicitly requested
+  reset-mode:
+    value: "soft"
+  dS-du:
+    value: "Gamma"
+  du-du:
+    value: "conservative_cgrad_2"
+  
+  # Swept hyperparameters
+  snnbp-alpha:
+    distribution: uniform
+    min: 0.5
+    max: 10.0
+  snnbp-beta:
+    distribution: uniform
+    min: 0.5
+    max: 10.0
+  snnbp-epsilon:
+    distribution: uniform
+    min: 0.05
+    max: 1.0
+  snnbp-intervention:
+    distribution: uniform
+    min: 0.1
+    max: 1.0
+  snnbp-p:
+    distribution: uniform
+    min: 0.1
+    max: 50.0
+    
+  # Standard training hyperparameters
+  lr:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 1e-2
+  weight-decay:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 1e-1
+
+early_terminate:
+  type: hyperband
+  min_iter: 15
+  eta: 3

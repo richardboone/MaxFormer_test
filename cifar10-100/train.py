@@ -97,6 +97,16 @@ try:
     has_wandb = True
 except ImportError:
     has_wandb = False
+    
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
@@ -352,6 +362,9 @@ parser.add_argument('--gama', type=float, default=1.0)
 parser.add_argument('--use-custom-neuron', action='store_true', default=True, help='Use custom neuron implementation')
 parser.add_argument('--surrogate-alpha', type=float, default=4.0, 
                     help='Alpha parameter for sigmoid surrogate gradient')
+parser.add_argument('--detach-reset', type=str2bool, default=True, help='Detach reset gradient')
+parser.add_argument('--reset-mode', type=str, default='hard', choices=['hard', 'soft'],
+                    help='LIF neuron reset mode: hard (multiply by 1-S) or soft (subtract V_th*S)')
 
 def _parse_args():
     # Do we have a config file to parse?

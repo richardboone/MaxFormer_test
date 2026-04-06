@@ -170,6 +170,8 @@ def parse_args():
     parser.add_argument('--snnbp-max-ratio', type=float, default=3.0, help='stable_cgrad: max gradient multiplier vs base')
     parser.add_argument('--snnbp-decay', type=float, default=0.5, help='adaptive_cgrad: trust decay for large base gradients')
     parser.add_argument('--snnbp-intervention', type=float, default=0.8, help='conservative_cgrad: confidence threshold for intervention')
+    parser.add_argument('--snnbp-eta', type=float, default=0.5, help='conservative_cgrad: correction magnitude constant')
+    parser.add_argument('--snnbp-blend', type=float, default=0.5, help='conservative_cgrad: blend scale factor')
     parser.add_argument('--surrogate-alpha', type=float, default=4.0, help='Alpha for sigmoid surrogate gradient')
     parser.add_argument('--gama', type=float, default=1.0)
     parser.add_argument('--use-custom-neuron', action='store_true', default=True, help='Use custom neuron implementation')
@@ -185,7 +187,9 @@ def parse_args():
     if args_config.config:
         with open(args_config.config, 'r') as f:
             cfg = yaml.safe_load(f)
-            parser.set_defaults(**cfg)
+            # Convert hyphens to underscores so argparse correctly overrides default values mapping to destination keys
+            cfg_cleaned = {k.replace('-', '_'): v for k, v in cfg.items()}
+            parser.set_defaults(**cfg_cleaned)
 
     args = parser.parse_args(remaining)
     return args

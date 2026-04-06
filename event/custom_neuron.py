@@ -285,6 +285,8 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 alpha = getattr(args, 'snnbp_alpha', 2.0)  # Higher = more selective
                 beta = getattr(args, 'snnbp_beta', 2.0)
                 intervention_threshold = getattr(args, 'snnbp_intervention', 0.8)
+                eta = getattr(args, 'snnbp_eta', 0.5)        # Correction magnitude constant
+                blend_scale = getattr(args, 'snnbp_blend', 0.5)  # Blend scale factor
                 
                 delta = u1 - thresh
                 
@@ -316,14 +318,14 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 # Soft intervention: interpolate toward corrected direction
                 # Instead of replacing gradient, dampen the problematic component
                 correction_direction = torch.sign(m_grad)
-                correction_magnitude = base_function.abs() * 0.5  # Match base scale
+                correction_magnitude = base_function.abs() * eta  # Match base scale
                 soft_correction = correction_direction * correction_magnitude
                 
                 # Smooth blending (gradual damping, not hard switch)
                 blend_factor = do_intervene * torch.sigmoid(5 * (intervention_signal - intervention_threshold))
                 
                 # Final gradient: mostly base, with soft correction in extreme cases
-                dL_dU1 = (1 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
+                dL_dU1 = (1 - blend_scale * blend_factor) * base_function + blend_scale * blend_factor * soft_correction
 
             elif mode == "conservative_ablate":
                 """

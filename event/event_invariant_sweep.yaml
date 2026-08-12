@@ -1,0 +1,139 @@
+# =============================================================================
+# Sweep: invariant_cgrad on CIFAR10-DVS (Max-Former)
+#
+#   wandb sweep event_invariant_sweep.yaml
+#   python run_sweep.py <SWEEP_ID>          # update GPUS_TO_USE first
+#
+# Design notes, because several choices here are deliberate departures from the
+# existing sweep configs in this directory:
+#
+# 1. metric is val/mean_last10, NOT val/max. Max-over-epochs is the maximum of a
+#    noisy sequence: upward-biased, higher variance, and biased *more* for runs
+#    with jumpier curves, so optimising it structurally rewards instability --
+#    the opposite of what C-Grad claims to provide. On synthetic runs of
+#    identical quality, val/max was biased +2.0 points with sd 0.35 against an
+#    unbiased sd 0.27 for the trailing mean.
+#
+# 2. method is random, not bayes. The measured seed-to-seed noise floor on this
+#    dataset is ~1.5 points (three invariant_cgrad seeds spanned 1.1 points at
+#    identical hyperparameters). Bayesian search against an objective that noisy
+#    chases the upper tail of the noise distribution and converges on configs
+#    that will not replicate. Random search gives unbiased coverage, supports a
+#    post-hoc response-surface fit, and is what a sensitivity analysis needs.
+#
+# 3. NO early_terminate. The objective averages the last 10 epochs; killing runs
+#    early makes it meaningless.
+#
+# 4. lr and weight-decay are pinned. Co-sweeping them (as event_sweep_config.yaml
+#    does) inflates the search space and conflates "good optimiser settings" with
+#    "good C-Grad settings".
+#
+# 5. Only parameters that invariant_cgrad actually reads are swept. snnbp-p,
+#    snnbp-blend, snnbp-intervention, snnbp-max-ratio, snnbp-k-dir and
+#    snnbp-decay are NOT read by this mode; sweeping them burns GPU time and
+#    manufactures fake sensitivity results (this is what happened to two rows of
+#    the paper's Table 9).
+#
+# 6. snnbp-h stays <= 0.75 while alpha_d * epsilon >= 1.0 * 0.15. The
+#    intervention signal is capped at sigmoid(alpha_d*epsilon)**(1/3), which is
+#    >= 0.813 everywhere in the swept ranges, so no sampled configuration can be
+#    structurally dead. Configurations that are *effectively* dead are still
+#    possible (e.g. large kappa), which is what cgrad/intervention_rate is for.
+#
+# READ THE RESULTS WITH cgrad/intervention_rate. Any run reporting ~0% trained as
+# plain BPTT regardless of its hyperparameters; it is a baseline sample, not a
+# C-Grad sample, and must be excluded before ranking.
+# =============================================================================
+
+program: train.py
+name: invariant_cgrad_cifar10dvs
+method: random
+
+metric:
+  goal: maximize
+  name: val/mean_last10
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - "--log-wandb"
+  - "--early-stop-patience=-1"
+  - ${args}
+
+parameters:
+  # ---- fixed: task, model, data ------------------------------------------
+  config:
+    value: ./cifar10dvs_invariant.yaml
+  data-path:
+    value: /data/rboone/datasets/wg_dvst
+  model:
+    value: max_former
+  du-du:
+    value: invariant_cgrad
+  dS-du:
+    value: Gamma
+  use-custom-neuron:
+    value: true
+  detach-reset:
+    value: true
+  snnbp-tau:
+    value: 0.5
+
+  # ---- fixed: optimisation ------------------------------------------------
+  # Stage-1 screening length. Confirm the winners at the full 96 epochs.
+  epochs:
+    value: 50
+  lr:
+    value: 0.0045
+  weight-decay:
+    value: 0.0079
+
+  # ---- fixed: instrumentation --------------------------------------------
+  log-cgrad-stats:
+    value: true
+  cgrad-stats-prob:
+    value: 0.125
+  # pinned so the logged key is exactly val/mean_last10, matching metric.name
+  metric-window:
+    value: 10
+
+  # ---- swept: rate knobs (expected to dominate) ---------------------------
+  # kappa is the harmfulness margin in units of the per-layer RMS of m, and is
+  # the strongest single control on the intervention rate: at the default gates
+  # kappa 0.5 -> ~12%, 1.0 -> ~3%, 1.5 -> ~1%, 2.0 -> ~0.2%.
+  snnbp-kappa:
+    distribution: uniform
+    min: 0.25
+    max: 2.25
+  snnbp-h:
+    distribution: uniform
+    min: 0.30
+    max: 0.75
+  snnbp-epsilon:
+    distribution: uniform
+    min: 0.15
+    max: 0.50
+
+  # ---- swept: correction strength ----------------------------------------
+  snnbp-eta:
+    distribution: uniform
+    min: 0.10
+    max: 1.00
+
+  # ---- swept: gate steepnesses (expected to be secondary) -----------------
+  snnbp-alpha:
+    distribution: log_uniform_values
+    min: 0.5
+    max: 6.0
+  snnbp-beta:
+    distribution: log_uniform_values
+    min: 1.0
+    max: 4.0
+  snnbp-alpha-cons:
+    distribution: log_uniform_values
+    min: 0.5
+    max: 8.0
+
+  # snnbp-gamma is held at its default of 5.0. It only controls smoothness in a
+  # narrow band around h, and dropping it keeps the search at 7 dimensions.

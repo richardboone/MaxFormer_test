@@ -1,14 +1,126 @@
 import torch
 import torch.nn as nn
 import math
+import random
 from spikingjelly.clock_driven.neuron import MultiStepLIFNode as OriginalLIFNode
 
 # --- Global Args Handler ---
 GLOBAL_ARGS = None
+_INVARIANT_GATE_CHECKED = False
 
 def set_global_args(args):
     global GLOBAL_ARGS
     GLOBAL_ARGS = args
+
+
+# --- C-Grad intervention statistics -----------------------------------------
+# Off by default. When enabled, invariant_cgrad accumulates how often it actually
+# intervenes. This matters for hyperparameter sweeps: a configuration whose gate
+# never opens trains as plain BPTT, scores like the baseline, and is otherwise
+# indistinguishable from a genuinely good configuration -- so without this metric
+# a sweep cannot tell "good hyperparameters" from "did nothing".
+#
+# All accumulation stays on-device so the backward pass never blocks on a host
+# sync; the single sync happens in pop_cgrad_stats() once per epoch. Collection is
+# sampled (see enable_cgrad_stats) to keep the cost off the critical path.
+_CGRAD_STATS = None
+_CGRAD_STATS_P = 0.125      # sampling probability per backward call
+_CGRAD_TOTAL = 0.0          # kept on the host: numel needs no kernel
+
+_STAT_KEYS = ('fired', 'm_neg', 'signal_sum', 'near_thresh')
+
+
+def enable_cgrad_stats(device, sample_prob=0.125):
+    """Start collecting intervention statistics.
+
+    Statistics are gathered on a random `sample_prob` fraction of backward calls.
+    A training run touches hundreds of millions of neuron-timesteps, so an eighth
+    of them estimates the intervention rate to far better precision than needed,
+    at roughly an eighth of the cost. Sampling is random rather than strided
+    because a fixed stride can alias against the number of neuron layers per step
+    and silently always sample the same layers.
+    """
+    global _CGRAD_STATS, _CGRAD_STATS_P, _CGRAD_TOTAL
+    _CGRAD_STATS = {k: torch.zeros((), device=device, dtype=torch.float64)
+                    for k in _STAT_KEYS}
+    _CGRAD_STATS_P = sample_prob
+    _CGRAD_TOTAL = 0.0
+
+
+def disable_cgrad_stats():
+    global _CGRAD_STATS, _CGRAD_TOTAL
+    _CGRAD_STATS = None
+    _CGRAD_TOTAL = 0.0
+
+
+def pop_cgrad_stats():
+    """Return accumulated statistics as plain floats and reset the counters.
+
+    Returns None when collection is disabled or nothing was sampled. Performs one
+    device->host sync, once per epoch.
+    """
+    global _CGRAD_TOTAL
+    if _CGRAD_STATS is None or _CGRAD_TOTAL == 0:
+        return None
+    total = _CGRAD_TOTAL
+    fired = _CGRAD_STATS['fired'].item()
+    out = {
+        'cgrad/intervention_rate': fired / total,
+        'cgrad/mean_signal': _CGRAD_STATS['signal_sum'].item() / total,
+        'cgrad/near_threshold_rate': _CGRAD_STATS['near_thresh'].item() / total,
+        # Fraction of interventions that act on a crossing predicted to REDUCE
+        # loss. Sec 6.1 says these should not occur; in practice they are about
+        # half of all interventions, and suppressing them collapses training.
+        'cgrad/frac_interventions_m_neg':
+            (_CGRAD_STATS['m_neg'].item() / fired) if fired > 0 else 0.0,
+        'cgrad/neuron_timesteps_sampled': total,
+    }
+    for k in _STAT_KEYS:
+        _CGRAD_STATS[k].zero_()
+    _CGRAD_TOTAL = 0.0
+    return out
+
+
+def _accumulate_cgrad_stats(do_intervene, signal, m, near_thresh):
+    """Accumulate on-device; no host sync, no effect on the returned gradient.
+
+    Reductions run in fp32 rather than fp64: every accumulated quantity is either
+    a count or a sum of values in [0,1], so fp32 is exact for counts up to 2**24
+    and the fp64 scalar accumulators still carry the running totals.
+    """
+    global _CGRAD_TOTAL
+    s = _CGRAD_STATS
+    s['fired'] += do_intervene.sum(dtype=torch.float32)
+    s['m_neg'] += (do_intervene * (m < 0)).sum(dtype=torch.float32)
+    s['signal_sum'] += signal.sum(dtype=torch.float32)
+    s['near_thresh'] += near_thresh.sum(dtype=torch.float32)
+    _CGRAD_TOTAL += float(do_intervene.numel())
+
+
+def _check_invariant_gate_reachable(alpha_d, epsilon, h):
+    """Warn once if invariant_cgrad is configured so that it can never intervene.
+
+    The intervention signal is the geometric mean of three gates, and g_d cannot
+    exceed sigmoid(alpha_d*epsilon), so the signal is capped at
+    sigmoid(alpha_d*epsilon)**(1/3). An h at or above that cap makes the mode a
+    silent no-op -- it trains, it converges, and it is simply standard BPTT.
+    conservative_cgrad has this failure mode with the benchmark defaults and gives
+    no indication of it, so it is worth surfacing here.
+    """
+    global _INVARIANT_GATE_CHECKED
+    if _INVARIANT_GATE_CHECKED:
+        return
+    _INVARIANT_GATE_CHECKED = True
+    ceiling = (1.0 / (1.0 + math.exp(-alpha_d * epsilon))) ** (1.0 / 3.0)
+    if h >= ceiling:
+        import warnings
+        warnings.warn(
+            f"invariant_cgrad: snnbp_h={h:.3f} is at or above the attainable "
+            f"ceiling of the intervention signal ({ceiling:.3f}, set by "
+            f"sigmoid(alpha_d*epsilon)**(1/3) with alpha_d={alpha_d}, "
+            f"epsilon={epsilon}). C-Grad will never intervene and training will "
+            f"be identical to standard BPTT. Lower snnbp_h or raise "
+            f"snnbp_beta/snnbp_epsilon.", RuntimeWarning)
 
 # --- Custom Autograd Function ---
 class TimeParallel_LIFSpike(torch.autograd.Function):
@@ -310,6 +422,7 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 beta = getattr(args, 'snnbp_beta', 2.0)
                 intervention_threshold = getattr(args, 'snnbp_intervention', 0.8)
                 eta = getattr(args, 'snnbp_eta', 0.5)        # Correction magnitude constant
+                p = getattr(args, 'snnbp_p', 0.5)
                 blend_scale = getattr(args, 'snnbp_blend', 0.5)  # Blend scale factor
                 
                 delta = u1 - thresh
@@ -367,8 +480,9 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 epsilon = getattr(args, 'snnbp_epsilon', 0.3)
                 alpha = getattr(args, 'snnbp_alpha', 2.0)  # Higher = more selective
                 beta = getattr(args, 'snnbp_beta', 2.0)
-                p = getattr(args, 'snnbp_p', 0.5)
                 intervention_threshold = getattr(args, 'snnbp_intervention', 0.8)
+                eta = getattr(args, 'snnbp_eta', 0.5)        # Correction magnitude constant
+                p = getattr(args, 'snnbp_p', 0.5)
                 
                 delta = u1 - thresh
                 
@@ -392,7 +506,7 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 # High-threshold gates (only activate in clear cases)
                 g_m = torch.sigmoid(alpha * (m.abs() - 0.1))  # Only for significant m
                 g_d = torch.sigmoid(beta * (epsilon - delta.abs()))  # Near threshold
-                g_misalign = torch.sigmoid(alpha * misalignment)  # Clear misalignment
+                g_misalign = torch.sigmoid(p * misalignment)  # Clear misalignment
                 
                 # Combined intervention signal
                 intervention_signal = g_m * g_d * g_misalign
@@ -409,8 +523,7 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 # Smooth blending (gradual damping, not hard switch)
                 blend_factor = do_intervene * torch.sigmoid(5 * (intervention_signal - intervention_threshold))
                 
-                # Final gradient: mostly base, with soft correction in extreme cases
-                dL_dU1 = (1 - blend_scale * blend_factor) * base_function + blend_scale * blend_factor * soft_correction
+                dL_dU1 = (1 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
 
             elif mode == "conservative_ablate":
                 """
@@ -478,6 +591,150 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
 
                 # Final gradient
                 dL_dU1 = (1 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
+
+            elif mode == "invariant_cgrad":
+                """
+                Scale-Invariant C-Grad
+                ----------------------
+                Same three-gate structure as conservative_cgrad, but the gates are
+                dimensionless, so the rule is equivariant under rescaling of the loss:
+                replacing L by c*L leaves the produced gradient direction unchanged and
+                scales its magnitude by exactly c.
+
+                Motivation. dL_dS and dL_dU2 -- and therefore m[t] and base_function --
+                carry units of loss, and loss has no canonical scale. It is set by the
+                AMP GradScaler (65536 by default, and halved/doubled dynamically during
+                training), by the batch size under mean reduction, by the TET lambda, and
+                by depth: the first patch-embed layer and the last transformer block see
+                gradients orders of magnitude apart inside a single backward pass.
+                conservative_cgrad compares |m| against the constant 0.1 and feeds
+                m*base_function (quadratic in the loss scale) into a sigmoid, so its gates
+                open and close for reasons unrelated to the neuron. Consistency itself is
+                a sign test and is scale-free; this mode makes the gates scale-free too.
+
+                Construction. Following Sec. 4 of the paper, write the two competing
+                estimates of the loss change induced by a minimal threshold crossing:
+
+                    dL_pred = rho[t] * base_function      (Eq. 6, surrogate-predicted)
+                    dL_jump = m[t]                        (Eq. 7/13, jump-induced)
+
+                Both carry units of loss, so their ratio is dimensionless and their
+                product normalised by a common loss-scale statistic is too. The update is
+                inconsistent (Eq. 10) exactly when dL_pred * dL_jump < 0. Normalising both
+                by the RMS loss-scale of the current tensor removes the scale and, because
+                the statistic is computed per layer and per timestep, also equalises the
+                gate across depth.
+
+                Hyperparameters. alpha_m, alpha_d, h and eta keep their conservative_cgrad
+                meanings; kappa is the harmfulness margin (now relative to the typical
+                harmfulness in this layer rather than an absolute loss), and alpha_c
+                replaces the reuse of alpha_m for the consistency gate. eta is applied
+                here, unlike in conservative_cgrad where it is read but never used.
+                snnbp_blend is deliberately not read: Table 3 lists b as a hyperparameter,
+                but in Algorithm 1 b is the computed smooth factor sigma(gamma*(w-h)) and
+                a separate constant multiplier would be redundant with eta.
+                """
+                epsilon = getattr(args, 'snnbp_epsilon', 0.3)
+                alpha = getattr(args, 'snnbp_alpha', 2.0)          # alpha_m, harmfulness
+                beta = getattr(args, 'snnbp_beta', 2.0)            # alpha_d, proximity
+                alpha_c = getattr(args, 'snnbp_alpha_cons', 2.0)   # consistency gate
+                kappa = getattr(args, 'snnbp_kappa', 1.0)          # relative margin on |m|
+                # Deliberately NOT snnbp_intervention: that parameter defaults to 0.8 for
+                # conservative_cgrad, and 0.8 drives this mode to a 0.00% intervention
+                # rate. Sharing it would silently turn the method into a no-op.
+                intervention_threshold = getattr(args, 'snnbp_h', 0.5)
+                eta = getattr(args, 'snnbp_eta', 0.5)              # correction strength
+                gamma = getattr(args, 'snnbp_gamma', 5.0)          # blend sharpness
+                two_sided = getattr(args, 'snnbp_two_sided', True)
+                _check_invariant_gate_reachable(beta, epsilon, intervention_threshold)
+
+                delta = u1 - thresh
+                rho = thresh - u1
+
+                # Jump-induced loss change m[t] (Eq. 13 hard reset / Eq. 22 soft reset)
+                if reset_mode == 'soft':
+                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
+                else:
+                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
+                term_sub_threshold = dL_dS - (u1 * dL_dU2)
+
+                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
+                m_grad = torch.where(u1 < thresh, m, -m)
+
+                # Base Function (Standard BPTT)
+                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
+
+                # Surrogate-predicted loss change under the minimal crossing (Eq. 6)
+                dL_pred = rho * base_function
+
+                # Common loss-scale statistic for this layer at this timestep. Both terms
+                # carry units of loss, so norm scales linearly with the loss scale and
+                # dividing by it cancels the scale exactly. Reduced over every element
+                # (batch and features) of the current tensor, which also equalises the
+                # gate across depth.
+                #
+                # Computed in fp32 regardless of the incoming dtype: under AMP the loss
+                # scale pushes |m| into the thousands, and m**2 would overflow fp16 to inf.
+                # The normalised quantities are O(1), so casting them back is always safe.
+                m32 = m.float()
+                pred32 = dL_pred.float()
+                norm = torch.sqrt(m32.pow(2).mean() + pred32.pow(2).mean()).clamp(min=1e-30)
+                m_hat = (m32 / norm).to(m.dtype)
+                pred_hat = (pred32 / norm).to(m.dtype)
+
+                # Gate 1: harmfulness, now relative to the typical harmfulness in this
+                # layer. kappa is dimensionless, unlike the hardcoded 0.1 it replaces.
+                if two_sided:
+                    g_m = torch.sigmoid(alpha * (m_hat.abs() - kappa))
+                else:
+                    # Paper Sec. 6.1 as literally written: act only on harmful crossings.
+                    g_m = torch.sigmoid(alpha * (m_hat - kappa))
+
+                # Gate 2: nearness to threshold. Unchanged -- delta is a membrane
+                # potential measured in units of V_th, which is a genuine physical scale.
+                g_d = torch.sigmoid(beta * (epsilon - delta.abs()))
+
+                # Gate 3: consistency (Eq. 10). The product is negative exactly when the
+                # surrogate-predicted and jump-induced loss changes disagree in sign, so
+                # this gate opens precisely on inconsistent updates.
+                g_cons = torch.sigmoid(alpha_c * (-m_hat * pred_hat))
+
+                # Combined intervention signal, as the geometric mean of the three gates
+                # rather than their raw product.
+                #
+                # A product of three sigmoids is badly miscalibrated as a soft AND: each
+                # factor is bounded well below 1 (g_d in particular can never exceed
+                # sigmoid(alpha_d*epsilon), which is 0.62 at the paper's defaults), so the
+                # product has a ceiling near 0.3 and any h above that makes the rule dead
+                # -- silently, with no error and no gradient change. That is exactly the
+                # failure conservative_cgrad exhibits: with the benchmark defaults
+                # (alpha_d=2.0, epsilon=0.3, h=0.8) its ceiling is 0.646 < h and it can
+                # never fire at all. The geometric mean keeps the same "all three gates
+                # must agree" semantics while staying in [0,1] and remaining reachable,
+                # so h reads as "the typical gate value required to intervene".
+                intervention_signal = (g_m * g_d * g_cons).pow(1.0 / 3.0)
+
+                # Only intervene past threshold
+                do_intervene = (intervention_signal > intervention_threshold).float()
+
+                # random.random() rather than torch.rand(): a host-side draw costs
+                # nothing, whereas sampling on device would force a sync.
+                if _CGRAD_STATS is not None and random.random() < _CGRAD_STATS_P:
+                    _accumulate_cgrad_stats(do_intervene, intervention_signal, m,
+                                            delta.abs() <= epsilon)
+
+                # Corrective direction (Algorithm 1 line 11): sign(m*rho) repels u1 from
+                # the threshold when m > 0 and attracts it when m < 0. Magnitude is tied
+                # to |base_function| so the correction is equivariant by construction.
+                soft_correction = torch.sign(m_grad) * base_function.abs()
+
+                # Smooth blending (Algorithm 1 lines 6-9), then the eta-weighted
+                # interpolation of line 12: g_cgrad = (1 - eta*b)*g_base + eta*b*g_corr
+                blend_factor = do_intervene * torch.sigmoid(
+                    gamma * (intervention_signal - intervention_threshold))
+                w = eta * blend_factor
+
+                dL_dU1 = (1 - w) * base_function + w * soft_correction
 
             elif mode == "":
                 print("not ready")

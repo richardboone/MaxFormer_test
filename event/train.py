@@ -172,9 +172,17 @@ def parse_args():
     parser.add_argument('--snnbp-intervention', type=float, default=0.8, help='conservative_cgrad: confidence threshold for intervention')
     parser.add_argument('--snnbp-eta', type=float, default=0.5, help='conservative_cgrad: correction magnitude constant')
     parser.add_argument('--snnbp-blend', type=float, default=0.5, help='conservative_cgrad: blend scale factor')
+    parser.add_argument('--snnbp-alpha-cons', type=float, default=2.0, help='invariant_cgrad: steepness of the consistency gate')
+    parser.add_argument('--snnbp-kappa', type=float, default=1.0, help='invariant_cgrad: harmfulness margin, relative to per-layer RMS of m')
+    parser.add_argument('--snnbp-h', type=float, default=0.5, help='invariant_cgrad: intervention threshold (separate from --snnbp-intervention, whose 0.8 default would make this mode a no-op)')
+    parser.add_argument('--snnbp-gamma', type=float, default=5.0, help='invariant_cgrad: sharpness of the smooth blend around h')
+    parser.add_argument('--snnbp-two-sided', type=str2bool, default=True, help='invariant_cgrad: gate on |m| (two-sided) rather than m (harmful crossings only)')
+    parser.add_argument('--log-cgrad-stats', type=str2bool, default=False, help='invariant_cgrad: accumulate and log the intervention rate (essential for sweeps: a config whose gate never opens is otherwise indistinguishable from a good one)')
+    parser.add_argument('--cgrad-stats-prob', type=float, default=0.125, help='fraction of backward calls sampled for --log-cgrad-stats')
+    parser.add_argument('--metric-window', type=int, default=10, help='window k for the val/mean_last{k} sweep objective')
     parser.add_argument('--surrogate-alpha', type=float, default=4.0, help='Alpha for sigmoid surrogate gradient')
     parser.add_argument('--gama', type=float, default=1.0)
-    parser.add_argument('--use-custom-neuron', action='store_true', default=True, help='Use custom neuron implementation')
+    parser.add_argument('--use-custom-neuron', type=str2bool, nargs='?', const=True, default=True, help='Use custom neuron implementation')
     parser.add_argument('--early-stop-patience', default=-1, type=int, 
                         help='epochs with no improvement after which training will be stopped. -1 to disable.')
     parser.add_argument('--detach-reset', type=str2bool, default=True, help='Detach reset gradient')
@@ -384,32 +392,45 @@ def main(args):
     
     max_test_acc1 = 0.
     test_acc5_at_max_test_acc1 = 0.
+    test_acc_history = []
 
     utils.init_distributed_mode(args)
     print(args)
 
-    output_dir = os.path.join(args.output_dir, f'{args.model}_b{args.batch_size}_T{args.T}')
-
-    if args.T_train:
-        output_dir += f'_Ttrain{args.T_train}'
-
-    if args.weight_decay:
-        output_dir += f'_wd{args.weight_decay}'
-
-    if args.opt == 'adamw':
-        output_dir += '_adamw'
+    if args.log_wandb:
+        # Metrics-only: everything worth keeping goes to wandb. The local output_dir
+        # is keyed solely on model/batch/T/weight-decay/optimizer/lr, all of which a
+        # sweep pins, so every run in a sweep resolves to the SAME directory and
+        # concurrent agents overwrite each other's checkpoints. An empty output_dir
+        # disables every local write below; each is guarded by `if output_dir`.
+        output_dir = ''
     else:
-        output_dir += '_sgd'
+        output_dir = os.path.join(args.output_dir, f'{args.model}_b{args.batch_size}_T{args.T}')
 
-    if not os.path.exists(output_dir):
-        utils.mkdir(output_dir)
+        if args.T_train:
+            output_dir += f'_Ttrain{args.T_train}'
 
-    output_dir = os.path.join(output_dir, f'lr{args.lr}')
-    if not os.path.exists(output_dir):
-        utils.mkdir(output_dir)
+        if args.weight_decay:
+            output_dir += f'_wd{args.weight_decay}'
+
+        if args.opt == 'adamw':
+            output_dir += '_adamw'
+        else:
+            output_dir += '_sgd'
+
+        if not os.path.exists(output_dir):
+            utils.mkdir(output_dir)
+
+        output_dir = os.path.join(output_dir, f'lr{args.lr}')
+        if not os.path.exists(output_dir):
+            utils.mkdir(output_dir)
 
     device = torch.device(args.device)
     print("device:", device)
+
+    if args.log_cgrad_stats:
+        custom_neuron.enable_cgrad_stats(device, sample_prob=args.cgrad_stats_prob)
+
     data_path = args.data_path
     dataset_train, dataset_test, train_sampler, test_sampler = load_data(args.dataset, data_path, args.distributed, args.T)
     data_loader = torch.utils.data.DataLoader(
@@ -470,10 +491,12 @@ def main(args):
     if utils.is_main_process():
         purge_step_train = args.start_epoch
         purge_step_te = args.start_epoch
-        os.makedirs(output_dir + '_logs', exist_ok=True)
-        args_content = yaml.safe_dump(args.__dict__, default_flow_style=False)
-        with open(output_dir + '_logs/args.txt', 'w', encoding='utf-8') as args_txt:
-            args_txt.write(args_content)
+        # Skipped under --log-wandb: wandb.init(config=args) already records these.
+        if output_dir:
+            os.makedirs(output_dir + '_logs', exist_ok=True)
+            args_content = yaml.safe_dump(args.__dict__, default_flow_style=False)
+            with open(output_dir + '_logs/args.txt', 'w', encoding='utf-8') as args_txt:
+                args_txt.write(args_content)
 
         print(f'purge_step_train={purge_step_train}, purge_step_te={purge_step_te}')
 
@@ -517,17 +540,37 @@ def main(args):
         else:
             patience_counter += 1
 
+        # Lower-variance sweep objectives. val/max is the maximum of a noisy
+        # sequence: upward-biased, high-variance, and biased *more* for runs with
+        # jumpier curves, so optimising it structurally rewards instability. The
+        # trailing mean is a far better target when the seed-to-seed noise floor
+        # is comparable to the effect being measured.
+        test_acc_history.append(test_acc1)
+        k = args.metric_window
+        val_mean_last_k = sum(test_acc_history[-k:]) / len(test_acc_history[-k:])
+
         if args.log_wandb and has_wandb:
-            wandb.log({
+            log_payload = {
                 "train/loss": train_loss,
                 "train/acc1": train_acc1,
-                "train/acc2": train_acc5,
+                "train/acc5": train_acc5,
                 "val/loss": test_loss,
                 "val/acc_tp1": test_acc1,
                 "val/acc_tp5": test_acc5,
                 "val/max": max_test_acc1,
+                f"val/mean_last{k}": val_mean_last_k,
                 "lr":  float(optimizer.param_groups[0]['lr']),
-            }, step = epoch)
+            }
+            cgrad_stats = custom_neuron.pop_cgrad_stats()
+            if cgrad_stats is not None:
+                log_payload.update(cgrad_stats)
+            wandb.log(log_payload, step = epoch)
+        elif args.log_cgrad_stats:
+            cgrad_stats = custom_neuron.pop_cgrad_stats()
+            if cgrad_stats is not None:
+                print(f"  [cgrad] epoch {epoch}: "
+                      + "  ".join(f"{k.split('/')[-1]}={v:.4g}"
+                                  for k, v in cgrad_stats.items()))
 
         if output_dir:
 

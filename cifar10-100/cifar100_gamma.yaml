@@ -6,7 +6,7 @@ num_heads: 12
 patch_size: 4
 mlp_ratio: 4
 
-data_path: '/data/rboone/datasets/cifar100/'
+data_path: ''
 dataset: torch/cifar100
 num_classes: 100
 img_size: 32
@@ -22,9 +22,8 @@ crop_pct: 1.0
 scale:
     - 1.0
     - 1.0
-ratio: [1.0, 1.0]
+ratio: [1.0,1.0]
 color_jitter: 0.
-interpolation: bicubic
 train_interpolation: bicubic
 aa: rand-m9-n1-mstd0.4-inc1
 mixup: 0.75
@@ -37,31 +36,20 @@ cutmix: 0.5
 reprob: 0.25
 remode: const
 amp: True
-batch_size: 64
-val_batch_size: 64
-
-# Best hyperparameters from CIFAR-10 Sweep
-lr: 0.001579767587025382
-weight_decay: 0.03636769062667741
-
-# Gradient & SNNBP settings
-du_du: conservative_cgrad
-dS_du: Gamma
-snnbp_alpha: 1.209609390718007
-snnbp_beta: 1.3665607164533111
-# snnbp_decay: 0.6053235214358093
-snnbp_epsilon: 0.35743030342249227
-snnbp_intervention: 0.5319400634485713
-snnbp_k_dir: 1.710829237696388
-snnbp_max_ratio: 1.9208628645125947
-
+batch_size: 64 #64
+val_batch_size: 64 #64
+lr: 1.5e-3 
 min_lr: 1e-5
 sched: cosine
+weight_decay: 0.06
 cooldown_epochs: 10
 warmup_epochs: 20
 warmup_lr: 0.00001
 opt: adamw
 smoothing: 0.1
 workers: 4
-seed: 50425
+# seed: 50425
+
 use_custom_neuron: True
+dS_du: Gamma
+du_du: LIF

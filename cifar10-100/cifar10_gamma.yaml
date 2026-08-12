@@ -1,4 +1,4 @@
-epochs: 400
+epochs: 2
 time_step: 4
 layer: 4
 dim: 384
@@ -6,8 +6,7 @@ num_heads: 12
 patch_size: 4
 mlp_ratio: 4
 
-# Updated with the path from your successful runs
-data_path: '/data/rboone/datasets/cifar10/'
+data_path: ''
 dataset: torch/cifar10
 num_classes: 10
 img_size: 32
@@ -40,29 +39,20 @@ remode: const
 amp: True
 batch_size: 128
 val_batch_size: 128
-
-# Best hyperparameters from Sweep Run 1
-lr: 0.004479767587025382
-weight_decay: 0.03636769062667741
-
-# Gradient & SNNBP settings from Sweep Run 1
-du_du: conservative_cgrad
-dS_du: Gamma
-snnbp_alpha: 1.209609390718007
-snnbp_beta: 1.3665607164533111
-# snnbp_decay: 0.6053235214358093
-snnbp_epsilon: 0.35743030342249227
-snnbp_intervention: 0.5319400634485713
-snnbp_k_dir: 1.710829237696388
-snnbp_max_ratio: 1.9208628645125947
-
+lr: 1.5e-3
+#1.5e-3
 min_lr: 1e-5
 sched: cosine
+weight_decay: 6e-2
 cooldown_epochs: 10
 warmup_epochs: 20
 warmup_lr: 0.00008
 opt: adamw
 smoothing: 0.1
 workers: 4
-# seed: 50425
+seed: 50425
+
+
 use_custom_neuron: True
+du_du: LIF
+dS_du: Gamma

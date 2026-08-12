@@ -7,7 +7,7 @@ import sys
 
 # --- Configuration ---
 GPUS_TO_USE = [4,5,6,7]  # GPUs you are willing to use
-GPU_MEMORY_THRESHOLD_MB = 50000  # Minimum free memory (in MB) to be considered "available"
+GPU_MEMORY_THRESHOLD_MB = 25000  # Minimum free memory (in MB) to be considered "available"
 MAX_AGENTS_PER_GPU = 1
 
 def get_available_gpus():

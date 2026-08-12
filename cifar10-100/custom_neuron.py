@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
 import math
+import os
 from spikingjelly.clock_driven.neuron import MultiStepLIFNode as OriginalLIFNode
 
 # --- Global Args Handler ---
 GLOBAL_ARGS = None
 METRICS_COLLECTOR = None
+DISABLE_CUPY = os.environ.get('DISABLE_CUPY', '0') == '1'
 
 def set_global_args(args):
     global GLOBAL_ARGS
@@ -428,6 +430,11 @@ class MultiStepLIFNode(nn.Module):
             
             # Handle potential mismatching args if necessary (e.g. backend)
             # SpikingJelly usually behaves well with extra kwargs or has backend.
+            if DISABLE_CUPY or (GLOBAL_ARGS is not None and getattr(GLOBAL_ARGS, 'disable_cupy', False)):
+                if 'backend' in oj_kwargs:
+                   oj_kwargs['backend'] = 'torch'
+                else:
+                   oj_kwargs['backend'] = 'torch'
             
             self.impl = OriginalLIFNode(
                 tau=tau, 

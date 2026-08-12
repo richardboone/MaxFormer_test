@@ -1,4 +1,5 @@
-python train.py --experiment cifar100 --config ./cifar100.yaml --model  ms_qkformer --data-path /data/datasets/cifar100/ --log-wandb --du-du LIF
+export CUDA_VISIBLE_DEVICES=0
+python train.py --experiment cifar100 --config ./cifar100_gamma.yaml --model  max_former --data-path /data/datasets/cifar100/ --log-wandb --time-step 8
 
 # or
 

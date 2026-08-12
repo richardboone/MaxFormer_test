@@ -1,7 +1,66 @@
+# ---- python ----------------------------------------------------------------
 **/__pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
 
-#Ignore logs and weights
-event/logs
-event/wandb
+# ---- environments ----------------------------------------------------------
+.venv/
+venv/
+# apex/ is a nested git clone (has its own .git). Tracking it would create a
+# phantom submodule that nobody can clone. Install it, don't commit it.
+apex/
 
+# ---- editor / tooling ------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ---- experiment logs (all subprojects, not just event/) --------------------
+wandb/
+**/wandb/
+**/logs/
+imagenet/log/
+imagenet/output/
+runs/
+lightning_logs/
+
+# ---- checkpoints & weights -------------------------------------------------
+*.pth
+*.pth.tar
+*.ckpt
+*.pt
+*.safetensors
+# but keep the fetch script that lives alongside them
+!imagenet/checkpoints/download.sh
+
+# ---- datasets & large intermediates ----------------------------------------
+*.pkl
+*.npy
+*.npz
+*.zip
+*.tar
+*.tar.gz
+*.h5
+*.hdf5
+data/
+datasets/
+event/download/
+
+# ---- generated figures & papers --------------------------------------------
+# All of these are regenerable by visualize_*.py / recreate_alignment_grid.py.
+# Commit the script, not the output. Drop these rules if a figure ever needs
+# to be pinned to an exact published version.
+*.png
+*.pdf
+*.svg
+figs/
+
+# ---- scratch ---------------------------------------------------------------
+git_temp.txt
+test_args.py
+test_argparse_yaml.py
+nohup.out
+core.*

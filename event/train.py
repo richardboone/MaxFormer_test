@@ -73,7 +73,7 @@ def parse_args():
     parser.add_argument( "--test-only", dest="test_only", help="Only test the model", action="store_true",)
 
     # Mixed precision training parameters
-    parser.add_argument('--amp', default=True, action='store_true',
+    parser.add_argument('--amp', type=str2bool, nargs='?', const=True, default=True,
                         help='Use AMP training')
 
 

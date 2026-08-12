@@ -34,6 +34,18 @@ from timm.utils import update_summary, random_seed, CheckpointSaver
 from max_former import maxformer
 from ms_qkformer import ms_qkformer
 import wandb
+import custom_neuron
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 
 #os.environ["WANDB_API_KEY"] = ""
 #os.environ["WANDB_MODE"] = "offline"
@@ -136,6 +148,8 @@ def get_args_parser():
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--resume', default='',
                         help='resume from checkpoint')
+    parser.add_argument('--finetune', default='', type=str,
+                        help='Finetune from checkpoint (loads weights only, fresh optimizer)')
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
@@ -159,6 +173,25 @@ def get_args_parser():
 
     # * Mixup params
     parser.add_argument("--mixup-off-epoch", default=0, type=int, metavar="N", help="Turn off mixup after this epoch, disabled if 0 (default: 0)")
+
+    # Extra consistency parameters
+    parser.add_argument('--du-du', type=str, default='complex54', help='Feedback gradient mode')
+    parser.add_argument('--dS-du', type=str, default='Gamma', help='Surrogate gradient mode')
+    parser.add_argument('--snnbp-alpha', type=float, default=1.1742)
+    parser.add_argument('--snnbp-beta', type=float, default=0.9245)
+    parser.add_argument('--snnbp-epsilon', type=float, default=0.3468)
+    parser.add_argument('--snnbp-p', type=float, default=9.5334)
+    parser.add_argument('--snnbp-k-dir', type=float, default=1.0)
+    parser.add_argument('--snnbp-tau', type=float, default=0.5, help='Decay factor (0.5 ~= tau 2.0)')
+    parser.add_argument('--snnbp-max-ratio', type=float, default=3.0, help='stable_cgrad: max gradient multiplier vs base')
+    parser.add_argument('--snnbp-decay', type=float, default=0.5, help='adaptive_cgrad: trust decay for large base gradients')
+    parser.add_argument('--snnbp-intervention', type=float, default=0.8, help='conservative_cgrad: confidence threshold for intervention')
+    parser.add_argument('--gama', type=float, default=1.0)
+    parser.add_argument('--use-custom-neuron', action='store_true', default=True, help='Use custom neuron implementation')
+    parser.add_argument('--surrogate-alpha', type=float, default=4.0, help='Alpha parameter for sigmoid surrogate gradient')
+    parser.add_argument('--detach-reset', type=str2bool, default=True, help='Detach reset gradient')
+    parser.add_argument('--reset-mode', type=str, default='hard', choices=['hard', 'soft'],
+                        help='LIF neuron reset mode: hard (multiply by 1-S) or soft (subtract V_th*S)')
 
 
     parser.add_argument('--model-ema', action='store_true', default=False,
@@ -263,6 +296,10 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
     model = create_model(args.model, T=args.time_step)
+
+    if args.finetune:
+        misc.load_old_ckpt(model, args.finetune, verbose=True)
+        print(f"Loaded finetune checkpoint from {args.finetune}")
 
     model.to(device)
 
@@ -408,6 +445,7 @@ def main(args):
 
 if __name__ == '__main__':
     args = get_args_parser()
+    custom_neuron.set_global_args(args)
     # args = args._parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)

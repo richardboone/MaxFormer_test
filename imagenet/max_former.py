@@ -2,9 +2,7 @@ import torch.nn as nn
 from timm.models.layers import trunc_normal_
 from timm.models.registry import register_model
 from timm.models.vision_transformer import _cfg
-from spikingjelly.clock_driven.neuron import (
-    MultiStepLIFNode,
-)
+from custom_neuron import MultiStepLIFNode
 from mixer_hub import *
 from embedding_hub import *
 

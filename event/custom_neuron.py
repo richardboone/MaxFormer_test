@@ -664,8 +664,39 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 # Base Function (Standard BPTT)
                 base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
 
-                # Surrogate-predicted loss change under the minimal crossing (Eq. 6)
-                dL_pred = rho * base_function
+                # Surrogate-predicted loss change under the minimal crossing (Eq. 6).
+                #
+                # 'product' is Eq. 6 verbatim and the default. It has a structural
+                # defect: dL_pred = rho*g_base is O(rho) while m is O(1) -- the reset
+                # jump does not shrink as u1 approaches V_th -- so the consistency gate
+                # sigmoid(alpha_c * (-m_hat*pred_hat)) has an argument that vanishes
+                # exactly where g_d = sigmoid(beta*(eps-|delta|)) is maximal. The two
+                # gates are mathematically opposed: g_d wants delta -> 0, which forces
+                # rho -> 0, which pins g_cons at sigmoid(0) = 0.5, i.e. no information.
+                # Measured on the synthetic harness, |−m_hat*pred_hat| < 0.05 for 58.7%
+                # of entries, and the resulting gate is ANTI-selective -- 14.6-21.5% of
+                # fired entries are genuinely inconsistent against a 27.5% base rate.
+                #
+                # Note Eq. 10 itself is a *sign* test, which is scale-free and perfectly
+                # well defined as rho -> 0. The defect is introduced by smoothing it with
+                # a sigmoid of the product, which reintroduces the magnitude dependence
+                # the sign test did not have.
+                #
+                #   'ref'  -- keep sign(rho), replace its magnitude with a fixed
+                #             reference distance. sign(pred) is unchanged, so Eq. 10 is
+                #             preserved exactly, but |pred| = thresh*|g_base| no longer
+                #             vanishes at the threshold. Proximity is already measured by
+                #             g_d; carrying it a second time inside g_cons double-counts
+                #             it with opposite sign, which is the conflict above.
+                #   'sign' -- the literal reading of Eq. 10: g_cons depends only on
+                #             sign(m)*sign(pred). Maximally scale-free, but discards
+                #             gradation (a marginal violation counts like a severe one).
+                consistency = getattr(args, 'snnbp_consistency', 'product')
+                if consistency == 'product':
+                    dL_pred = rho * base_function
+                else:
+                    dL_pred = torch.where(u1 < thresh, base_function,
+                                          -base_function) * thresh
 
                 # Common loss-scale statistic for this layer at this timestep. Both terms
                 # carry units of loss, so norm scales linearly with the loss scale and
@@ -697,7 +728,13 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                 # Gate 3: consistency (Eq. 10). The product is negative exactly when the
                 # surrogate-predicted and jump-induced loss changes disagree in sign, so
                 # this gate opens precisely on inconsistent updates.
-                g_cons = torch.sigmoid(alpha_c * (-m_hat * pred_hat))
+                if consistency == 'sign':
+                    # sign(m_hat)*sign(pred_hat) rather than a division by the
+                    # magnitudes: identical result, no underflow risk in fp16.
+                    g_cons = torch.sigmoid(
+                        alpha_c * (-torch.sign(m_hat) * torch.sign(pred_hat)))
+                else:
+                    g_cons = torch.sigmoid(alpha_c * (-m_hat * pred_hat))
 
                 # Combined intervention signal, as the geometric mean of the three gates
                 # rather than their raw product.

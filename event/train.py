@@ -177,6 +177,10 @@ def parse_args():
     parser.add_argument('--snnbp-h', type=float, default=0.5, help='invariant_cgrad: intervention threshold (separate from --snnbp-intervention, whose 0.8 default would make this mode a no-op)')
     parser.add_argument('--snnbp-gamma', type=float, default=5.0, help='invariant_cgrad: sharpness of the smooth blend around h')
     parser.add_argument('--snnbp-two-sided', type=str2bool, default=True, help='invariant_cgrad: gate on |m| (two-sided) rather than m (harmful crossings only)')
+    parser.add_argument('--snnbp-consistency', type=str, default='product', choices=['product', 'ref', 'sign'],
+                        help='invariant_cgrad: how the consistency gate is formed. product = Eq.6 verbatim, dL_pred = rho*g_base (default); '
+                             'ref = keep sign(rho) but use a fixed reference distance, so the gate does not vanish at the threshold; '
+                             'sign = literal Eq.10 sign test.')
     parser.add_argument('--snnbp-correction', type=str, default='blend', choices=['blend', 'mask', 'flip'],
                         help='invariant_cgrad: what an intervention does. blend = Algorithm 1 eta-weighted interpolation (default); '
                              'mask = zero the entry (suppress rather than redirect); flip = commit fully to the corrective direction. '

@@ -177,6 +177,10 @@ def parse_args():
     parser.add_argument('--snnbp-h', type=float, default=0.5, help='invariant_cgrad: intervention threshold (separate from --snnbp-intervention, whose 0.8 default would make this mode a no-op)')
     parser.add_argument('--snnbp-gamma', type=float, default=5.0, help='invariant_cgrad: sharpness of the smooth blend around h')
     parser.add_argument('--snnbp-two-sided', type=str2bool, default=True, help='invariant_cgrad: gate on |m| (two-sided) rather than m (harmful crossings only)')
+    parser.add_argument('--snnbp-correction', type=str, default='blend', choices=['blend', 'mask', 'flip'],
+                        help='invariant_cgrad: what an intervention does. blend = Algorithm 1 eta-weighted interpolation (default); '
+                             'mask = zero the entry (suppress rather than redirect); flip = commit fully to the corrective direction. '
+                             'mask and flip ignore snnbp-eta and snnbp-gamma.')
     parser.add_argument('--log-cgrad-stats', type=str2bool, default=False, help='invariant_cgrad: accumulate and log the intervention rate (essential for sweeps: a config whose gate never opens is otherwise indistinguishable from a good one)')
     parser.add_argument('--cgrad-stats-prob', type=float, default=0.125, help='fraction of backward calls sampled for --log-cgrad-stats')
     parser.add_argument('--metric-window', type=int, default=10, help='window k for the val/mean_last{k} sweep objective')

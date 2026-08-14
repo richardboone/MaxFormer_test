@@ -734,7 +734,41 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                     gamma * (intervention_signal - intervention_threshold))
                 w = eta * blend_factor
 
-                dL_dU1 = (1 - w) * base_function + w * soft_correction
+                # Mechanism ablation. 'blend' is Algorithm 1 and the default; the other
+                # two isolate *what* the intervention does from *when* it fires, which
+                # the blend confounds.
+                #
+                # Note the algebra of 'blend': on an inconsistent entry
+                # soft_correction = -base_function, so the update is (1-2w)*base_function
+                # with w = eta*blend_factor.
+                #
+                # blend_factor is bounded in (0.5, 1], but its *realized* value is much
+                # tighter than that bound, because the gate fires only where sig exceeds
+                # h, so sig-h is small by construction and sigmoid(gamma*(sig-h)) stays
+                # near 0.5. Measured over the 26 sweep configs with intervention rate
+                # above 10%, blend_factor has median 0.53-0.61 and p95 never above 0.76 --
+                # it never approaches 1. So in practice w ~ 0.57*eta and the multiplier is
+                # ~ 1 - 1.14*eta, crossing zero near eta = 0.88 rather than at 0.5.
+                #
+                # Consequently the published default eta=0.5 shrinks an inconsistent
+                # gradient by roughly 57% and never deletes or reverses it; the fraction
+                # of inconsistent entries that actually flip sign is 0% for eta <~ 0.70,
+                # ~14% at 0.76, ~50% at 0.88 and ~95% at 0.98. Reasoning from the (0.5, 1]
+                # bound alone puts the damper/redirector boundary at eta=0.5, which is
+                # wrong by a wide margin.
+                #
+                #   'mask' -- discard the entry entirely: use no information rather than
+                #             possibly-wrong information. eta and gamma are inert.
+                #   'flip' -- commit fully to the corrective direction. eta and gamma
+                #             are inert. This is the eta=1, hard-gate limit.
+                correction = getattr(args, 'snnbp_correction', 'blend')
+                if correction == 'mask':
+                    dL_dU1 = (1 - do_intervene) * base_function
+                elif correction == 'flip':
+                    dL_dU1 = torch.where(do_intervene.bool(),
+                                         soft_correction, base_function)
+                else:
+                    dL_dU1 = (1 - w) * base_function + w * soft_correction
 
             elif mode == "":
                 print("not ready")

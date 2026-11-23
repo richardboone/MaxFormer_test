@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import signal
 import time
 
 import matplotlib.pyplot as plt
@@ -444,15 +445,8 @@ def main(args):
     if args.log_wandb:
         if has_wandb:
             wandb_cfg = dict(**vars(args), triton_enabled=triton_enabled)
-            try:
-                wandb.init(
-                    project="maxformer_event",
-                    name=args.experiment if args.experiment else None,
-                    config=wandb_cfg,
-                )
-                wandb_active = True
-            except Exception as exc:
-                print(f"[WARN] wandb online init failed ({exc}); falling back to offline mode.")
+            wandb_mode = os.environ.get("WANDB_MODE", "").strip().lower()
+            if wandb_mode == "offline":
                 try:
                     wandb.init(
                         project="maxformer_event",
@@ -461,8 +455,28 @@ def main(args):
                         mode="offline",
                     )
                     wandb_active = True
-                except Exception as exc2:
-                    print(f"[WARN] wandb offline init also failed ({exc2}); continuing without wandb.")
+                except Exception as exc:
+                    print(f"[WARN] wandb offline init failed ({exc}); continuing without wandb.")
+            else:
+                try:
+                    wandb.init(
+                        project="maxformer_event",
+                        name=args.experiment if args.experiment else None,
+                        config=wandb_cfg,
+                    )
+                    wandb_active = True
+                except Exception as exc:
+                    print(f"[WARN] wandb online init failed ({exc}); falling back to offline mode.")
+                    try:
+                        wandb.init(
+                            project="maxformer_event",
+                            name=args.experiment if args.experiment else None,
+                            config=wandb_cfg,
+                            mode="offline",
+                        )
+                        wandb_active = True
+                    except Exception as exc2:
+                        print(f"[WARN] wandb offline init also failed ({exc2}); continuing without wandb.")
         else:
             print("You've requested to log metrics to wandb but package not found. "
                   "Metrics not being logged to wandb, try `pip install wandb`")
@@ -743,10 +757,20 @@ def main(args):
             }
             _write_json_atomic(summary_path, summary_payload)
         if wandb_active:
+            old_alarm_handler = signal.getsignal(signal.SIGALRM)
+
+            def _wandb_finish_timeout(signum, frame):
+                raise TimeoutError("wandb.finish timed out")
+
             try:
+                signal.signal(signal.SIGALRM, _wandb_finish_timeout)
+                signal.alarm(60)
                 wandb.finish()
             except Exception as exc:
                 print(f"[WARN] wandb.finish failed: {exc}")
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_alarm_handler)
 
     return max_test_acc1
 

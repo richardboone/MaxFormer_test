@@ -290,7 +290,7 @@ def both_prior_seeds_collapsed(arm_name, seed, seeds, summaries_dir):
             return False
         if s.get("status") == "nan_collapsed":
             collapsed_cnt += 1
-        elif s.get("status") == "completed" and s.get("val_mean_last_k", 100.0) < 35.0:
+        elif s.get("status") == "completed" and s.get("val_mean_last_k", 100.0) < 45.0:
             collapsed_cnt += 1
         else:
             return False
@@ -311,8 +311,9 @@ def main():
     parser.add_argument("--cgrad-stats-prob", type=float, default=0.02)
     parser.add_argument("--out-dir", default="./logs/stage1_eval")
     parser.add_argument("--arms", default="", help="Optional comma-separated subset of arm names")
-    parser.add_argument("--stall-timeout", type=int, default=900, help="Seconds of log inactivity before killing stalled run")
+    parser.add_argument("--stall-timeout", type=int, default=1200, help="Seconds of epoch progress inactivity before killing stalled run")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--wandb-online", action="store_true", help="Run wandb online instead of offline mode (sync afterward)")
     parser.add_argument("--dry-run", action="store_true")
     cli = parser.parse_args()
 
@@ -349,6 +350,7 @@ def main():
                 "config": arm["config"],
                 "flags": arm["flags"],
                 "summary_path": summary_path,
+                "epochs_jsonl_path": f"{summary_path[:-5]}.epochs.jsonl",
                 "log_path": os.path.join(run_logs_dir, f"{exp_name}.log"),
                 "retries": 0,
             })
@@ -375,38 +377,72 @@ def main():
         for job in active_jobs:
             t = job["task"]
             ret = job["proc"].poll()
-            if ret is None and cli.stall_timeout > 0:
-                last_activity = job["launch_time"]
-                if os.path.exists(t["log_path"]):
-                    last_activity = max(last_activity, os.path.getmtime(t["log_path"]))
-                idle = now - last_activity
-                if idle > cli.stall_timeout:
-                    log_msg(
-                        master_log,
-                        f"STALL {t['exp_name']} on GPU {job['gpu']} (idle {idle:.0f}s > {cli.stall_timeout}s) — killing process group",
-                    )
-                    try:
-                        os.killpg(job["proc"].pid, signal.SIGTERM)
-                        job["proc"].wait(timeout=10)
-                    except subprocess.TimeoutExpired:
+            summary = load_summary_status(t["summary_path"])
+            summary_fresh = bool(
+                summary
+                and os.path.exists(t["summary_path"])
+                and os.path.getmtime(t["summary_path"]) >= job["launch_time"] - 1.0
+            )
+            if ret is None:
+                if summary_fresh and summary.get("status") in ("completed", "nan_collapsed"):
+                    teardown_age = now - os.path.getmtime(t["summary_path"])
+                    if teardown_age > 60.0:
+                        log_msg(
+                            master_log,
+                            f"TEARDOWN {t['exp_name']} on GPU {job['gpu']} (summary completed {teardown_age:.0f}s ago) — terminating lingering process",
+                        )
                         try:
-                            os.killpg(job["proc"].pid, signal.SIGKILL)
+                            os.killpg(job["proc"].pid, signal.SIGTERM)
+                            job["proc"].wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(job["proc"].pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            try:
+                                job["proc"].wait(timeout=10)
+                            except Exception:
+                                pass
                         except ProcessLookupError:
                             pass
+                        ret = 0
+                elif cli.stall_timeout > 0:
+                    last_activity = job["launch_time"]
+                    if os.path.exists(t["epochs_jsonl_path"]):
+                        last_activity = max(last_activity, os.path.getmtime(t["epochs_jsonl_path"]))
+                    idle = now - last_activity
+                    if idle > cli.stall_timeout:
+                        log_msg(
+                            master_log,
+                            f"STALL {t['exp_name']} on GPU {job['gpu']} (idle {idle:.0f}s > {cli.stall_timeout}s) — killing process group",
+                        )
                         try:
+                            os.killpg(job["proc"].pid, signal.SIGTERM)
                             job["proc"].wait(timeout=10)
-                        except Exception:
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(job["proc"].pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            try:
+                                job["proc"].wait(timeout=10)
+                            except Exception:
+                                pass
+                        except ProcessLookupError:
                             pass
-                    except ProcessLookupError:
-                        pass
-                    ret = -99
+                        ret = -99
             if ret is None:
                 still_active.append(job)
                 continue
             job["log_fp"].close()
             summary = load_summary_status(t["summary_path"])
+            summary_fresh = bool(
+                summary
+                and os.path.exists(t["summary_path"])
+                and os.path.getmtime(t["summary_path"]) >= job["launch_time"] - 1.0
+            )
             st = summary.get("status") if summary else ("completed" if ret == 0 else "failed")
-            if ret == 0 and st == "completed":
+            if (ret == 0 and st == "completed") or (summary_fresh and st == "completed"):
                 acc_last = summary.get("val_mean_last_k", 0.0) if summary else 0.0
                 acc_max = summary.get("max_val_acc1", 0.0) if summary else 0.0
                 log_msg(
@@ -472,6 +508,8 @@ def main():
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
             env["PYTHONUNBUFFERED"] = "1"
+            if not cli.wandb_online and not cli.no_wandb:
+                env["WANDB_MODE"] = "offline"
 
             log_fp = open(t["log_path"], "a", encoding="utf-8")
             log_fp.write(f"\n=== Launching on GPU {gpu_id} at {datetime.datetime.now().isoformat()} ===\n")

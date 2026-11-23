@@ -72,31 +72,20 @@ def split_to_train_test_set(train_ratio, origin_dataset, num_classes):
 # One-epoch timing harness
 # ---------------------------------------------------------------------------
 def timed_train_one_epoch(model, criterion, optimizer, data_loader, device, scaler,
-                          mixup_fn, aug, trival_aug, print_every=50):
-    """Train for exactly one epoch, returning (total_seconds, num_batches, avg_loss)."""
+                          mixup_fn, aug, trival_aug, print_every=50, max_batches=0):
+    """Train for exactly one epoch (or max_batches), returning (total_seconds, num_batches, avg_loss)."""
     model.train()
     total_loss = 0.0
     num_batches = 0
 
-    # --- Warm-up: run 2 batches without timing to prime CUDA caches ---
-    warmup_iter = iter(data_loader)
+    # --- Warm-up: 2 steps with synthetic batch to prime CUDA caches and JIT without dangling worker queues ---
+    dummy_x = torch.randn(data_loader.batch_size, 2, 128, 128, device=device)
+    dummy_y = torch.zeros(data_loader.batch_size, dtype=torch.long, device=device)
     for _ in range(2):
-        try:
-            image, target = next(warmup_iter)
-        except StopIteration:
-            break
-        image, target = image.to(device).float(), target.to(device)
-        N = image.shape[0]
-        if aug is not None:
-            image = torch.stack([aug(image[i]) for i in range(N)])
-        if trival_aug is not None:
-            image = torch.stack([trival_aug(image[i]) for i in range(N)])
-        if mixup_fn is not None:
-            image, target = mixup_fn(image, target)
-        with amp.autocast():
-            output = model(image)
-            loss = criterion(output, target)
         optimizer.zero_grad()
+        with amp.autocast():
+            output = model(dummy_x)
+            loss = criterion(output, dummy_y)
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -105,6 +94,7 @@ def timed_train_one_epoch(model, criterion, optimizer, data_loader, device, scal
             loss.backward()
             optimizer.step()
         functional.reset_net(model)
+    del dummy_x, dummy_y
 
     # Sync before starting the clock
     if device.type == "cuda":
@@ -113,6 +103,9 @@ def timed_train_one_epoch(model, criterion, optimizer, data_loader, device, scal
     t_start = time.perf_counter()
 
     for batch_idx, (image, target) in enumerate(data_loader):
+        if max_batches > 0 and num_batches >= max_batches:
+            break
+
         image, target = image.to(device).float(), target.to(device)
         N = image.shape[0]
 
@@ -254,17 +247,21 @@ def main():
     parser.add_argument("--amp", action="store_true", default=True, help="Use AMP")
     parser.add_argument("--no-amp", dest="amp", action="store_false")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--print-every", type=int, default=50, help="Print progress every N batches")
+    parser.add_argument("--max-batches", type=int, default=100, help="Max batches to benchmark per config (0 for full epoch)")
+    parser.add_argument("--print-every", type=int, default=25, help="Print progress every N batches")
     cli = parser.parse_args()
 
     device = torch.device(cli.device)
 
     # ---- Configurations to compare ----
+    # (Label, dS_du, du_du, detach_reset, disable_triton)
     configs = [
-        ("Baseline: sigmoid + LIF",            "sigmoid", "LIF",               False),
-        ("Baseline: Gamma  + LIF",             "Gamma",   "LIF",               False),
-        ("C-Grad:   sigmoid + conservative",    "sigmoid", "conservative_cgrad", False),
-        ("C-Grad:   Gamma  + conservative",     "Gamma",   "conservative_cgrad", False),
+        ("PyTorch Baseline: Gamma + LIF",           "Gamma", "LIF",               False, "1"),
+        ("PyTorch C-Grad:   Gamma + conservative",  "Gamma", "conservative_cgrad", False, "1"),
+        ("PyTorch C-Grad:   Gamma + invariant",     "Gamma", "invariant_cgrad",    False, "1"),
+        ("Triton Baseline:  Gamma + LIF",           "Gamma", "LIF",               False, "0"),
+        ("Triton C-Grad:    Gamma + conservative",  "Gamma", "conservative_cgrad", False, "0"),
+        ("Triton C-Grad:    Gamma + invariant",     "Gamma", "invariant_cgrad",    False, "0"),
     ]
 
     # ---- Load dataset ONCE (expensive, don't repeat) ----
@@ -298,8 +295,9 @@ def main():
     print(f" device={device}  T={cli.T}  batch_size={cli.batch_size}  dim={cli.dim}  AMP={cli.amp}")
     print(f"{'=' * 72}\n")
 
-    for label, dS_du, du_du, detach_reset in configs:
+    for label, dS_du, du_du, detach_reset, disable_triton in configs:
         print(f"─── {label} ───")
+        os.environ['DISABLE_TRITON'] = disable_triton
 
         # Build fresh args, set global, build fresh model + optimizer
         args = build_args(cli, dS_du, du_du, detach_reset)
@@ -332,10 +330,10 @@ def main():
         epoch_secs, num_batches, avg_loss = timed_train_one_epoch(
             model, criterion, optimizer, data_loader, device, scaler,
             mixup_fn, train_snn_aug, train_trivalaug,
-            print_every=cli.print_every,
+            print_every=cli.print_every, max_batches=cli.max_batches,
         )
 
-        results[label] = epoch_secs
+        results[label] = (epoch_secs, num_batches)
         print(f"  ✓ {num_batches} batches in {epoch_secs:.2f}s  "
               f"({epoch_secs/num_batches*1000:.1f} ms/batch)  avg_loss={avg_loss:.4f}\n")
 
@@ -344,36 +342,36 @@ def main():
         torch.cuda.empty_cache()
 
     # ---- Summary ----
-    ref_label = "Baseline: sigmoid + LIF"
-    ref_secs = results[ref_label]
+    ref_label = "PyTorch Baseline: Gamma + LIF"
+    ref_secs = results[ref_label][0]
 
     print(f"\n{'=' * 72}")
     print(f" RESULTS SUMMARY")
     print(f"{'=' * 72}")
     print(f"{'Config':<45s} {'Time':>8s} {'ms/batch':>10s} {'Overhead':>10s}")
     print("─" * 75)
-    for label, secs in results.items():
+    for label, (secs, num_batches) in results.items():
         overhead_pct = ((secs - ref_secs) / ref_secs) * 100
         sign = "+" if overhead_pct >= 0 else ""
-        num_batches_approx = len(data_loader)
-        ms_per_batch = secs / num_batches_approx * 1000
+        ms_per_batch = secs / max(num_batches, 1) * 1000
         print(f"  {label:<43s} {secs:7.1f}s {ms_per_batch:9.1f}ms {sign}{overhead_pct:8.1f}%")
 
     print(f"\n  Reference: {ref_label}")
 
-    # Also show C-Grad vs same-surrogate baseline
+    # Also show PyTorch vs Triton speedups
     print(f"\n{'=' * 72}")
-    print(f" OVERHEAD BY SURROGATE GRADIENT")
+    print(f" TRITON SPEEDUP BREAKDOWN")
     print(f"{'=' * 72}")
     pairs = [
-        ("sigmoid", "Baseline: sigmoid + LIF", "C-Grad:   sigmoid + conservative"),
-        ("Gamma",   "Baseline: Gamma  + LIF",  "C-Grad:   Gamma  + conservative"),
+        ("LIF Baseline",        "PyTorch Baseline: Gamma + LIF",          "Triton Baseline:  Gamma + LIF"),
+        ("Conservative C-Grad", "PyTorch C-Grad:   Gamma + conservative", "Triton C-Grad:    Gamma + conservative"),
+        ("Invariant C-Grad",    "PyTorch C-Grad:   Gamma + invariant",    "Triton C-Grad:    Gamma + invariant"),
     ]
-    for surr, base_label, test_label in pairs:
-        base_s = results[base_label]
-        test_s = results[test_label]
-        oh = ((test_s - base_s) / base_s) * 100
-        print(f"  {surr:10s}:  {base_s:.1f}s → {test_s:.1f}s  ({oh:+.1f}%)")
+    for mode_name, py_label, tri_label in pairs:
+        py_s = results[py_label][0]
+        tri_s = results[tri_label][0]
+        speedup = py_s / max(tri_s, 1e-6)
+        print(f"  {mode_name:22s}:  PyTorch {py_s:5.1f}s  →  Triton {tri_s:5.1f}s  ({speedup:.2f}x faster)")
 
     print()
 

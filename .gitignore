@@ -24,6 +24,7 @@ wandb/
 **/logs/
 imagenet/log/
 imagenet/output/
+cifar10-100/output/
 runs/
 lightning_logs/
 

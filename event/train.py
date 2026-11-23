@@ -388,15 +388,20 @@ def load_data(dataset, dataset_dir, distributed, T):
 def main(args):
     # Pass args to the custom neuron module
     custom_neuron.set_global_args(args)
+    triton_enabled = (os.environ.get('DISABLE_TRITON', '0') != '1')
+    print(f"\n=======================================================")
+    print(f" [Backend] Triton Kernels: {'ENABLED' if triton_enabled else 'DISABLED (PyTorch fallback)'}")
+    print(f" [Neuron]  du_du: {args.du_du} | dS_du: {args.dS_du}")
+    print(f"=======================================================\n")
+
     if args.log_wandb:
         if has_wandb:
-                wandb.init(project="maxformer_event", 
-                        name = args.experiment,
-                        config=args)
-
+            wandb.init(project="maxformer_event", 
+                       name=args.experiment if args.experiment else None,
+                       config=dict(**vars(args), triton_enabled=triton_enabled))
         else:
             print("You've requested to log metrics to wandb but package not found. "
-                            "Metrics not being logged to wandb, try `pip install wandb`")
+                  "Metrics not being logged to wandb, try `pip install wandb`")
     
     max_test_acc1 = 0.
     test_acc5_at_max_test_acc1 = 0.
@@ -447,13 +452,14 @@ def main(args):
         shuffle=True,
         num_workers=args.workers,
         drop_last=True,
-        pin_memory=True)
+        pin_memory=True,
+        persistent_workers=True if args.workers > 0 else False)
 
     data_loader_test = torch.utils.data.DataLoader(
         dataset=dataset_test,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.workers,
+        num_workers=0,
         drop_last=False,
         pin_memory=True)
 
@@ -532,10 +538,12 @@ def main(args):
             train_sampler.set_epoch(epoch)
         if epoch >= 75:
             mixup_fn.mixup_enabled = False
+        t_epoch_start = time.perf_counter()
         train_loss, train_acc1, train_acc5 = train_one_epoch(
             model, criterion_train, optimizer, data_loader, device, epoch,
             args.print_freq, scaler, args.T_train,
             train_snn_aug, train_trivalaug, mixup_fn)
+        epoch_time_sec = time.perf_counter() - t_epoch_start
         lr_scheduler.step(epoch + 1)
 
         test_loss, test_acc1, test_acc5 = evaluate(model, criterion, data_loader_test, device=device, header='Test:')
@@ -562,6 +570,7 @@ def main(args):
                 "train/loss": train_loss,
                 "train/acc1": train_acc1,
                 "train/acc5": train_acc5,
+                "train/epoch_time_sec": epoch_time_sec,
                 "val/loss": test_loss,
                 "val/acc_tp1": test_acc1,
                 "val/acc_tp5": test_acc5,

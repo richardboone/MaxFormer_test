@@ -106,23 +106,18 @@ def main():
 
     # ---- Configurations to benchmark ----
     configs = {
-        "Baseline: sigmoid + LIF (no detach)": make_args(
-            dS_du="sigmoid", du_du="LIF", detach_reset=False
-        ),
-        "Baseline: Gamma  + LIF (no detach)": make_args(
-            dS_du="Gamma", du_du="LIF", detach_reset=False
-        ),
-        "Test:     sigmoid + conservative_cgrad": make_args(
-            dS_du="sigmoid", du_du="conservative_cgrad", detach_reset=False
-        ),
-        "Test:     Gamma  + conservative_cgrad": make_args(
-            dS_du="Gamma", du_du="conservative_cgrad", detach_reset=False
-        ),
+        "PyTorch Baseline: Gamma + LIF": (make_args(dS_du="Gamma", du_du="LIF", detach_reset=False), "1"),
+        "PyTorch C-Grad:   Gamma + conservative_cgrad": (make_args(dS_du="Gamma", du_du="conservative_cgrad", detach_reset=False), "1"),
+        "PyTorch C-Grad:   Gamma + invariant_cgrad": (make_args(dS_du="Gamma", du_du="invariant_cgrad", detach_reset=False), "1"),
+        "Triton Baseline:  Gamma + LIF": (make_args(dS_du="Gamma", du_du="LIF", detach_reset=False), "0"),
+        "Triton C-Grad:    Gamma + conservative_cgrad": (make_args(dS_du="Gamma", du_du="conservative_cgrad", detach_reset=False), "0"),
+        "Triton C-Grad:    Gamma + invariant_cgrad": (make_args(dS_du="Gamma", du_du="invariant_cgrad", detach_reset=False), "0"),
     }
 
     results = {}
 
-    for label, args in configs.items():
+    for label, (args, disable_triton) in configs.items():
+        os.environ['DISABLE_TRITON'] = disable_triton
         layer = LIFSpikeLayer_Cons(
             thresh=1.0, tau=cli.tau, gama=1.0,
             detach_reset=args.detach_reset, args=args,
@@ -146,7 +141,7 @@ def main():
 
     # ---- Comparison summary ----
     # Use first baseline (sigmoid + LIF) as the reference
-    ref_label = "Baseline: sigmoid + LIF (no detach)"
+    ref_label = "PyTorch Baseline: Gamma + LIF"
     ref_mean = results[ref_label][0]
 
     print(f"{'─' * 70}")

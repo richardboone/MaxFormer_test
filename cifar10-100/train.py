@@ -389,12 +389,18 @@ def main():
     args, args_text = _parse_args()
     # Pass args to the custom neuron module
     custom_neuron.set_global_args(args) # <--- Add this line
+    triton_enabled = (os.environ.get('DISABLE_TRITON', '0') != '1')
+    print(f"\n=======================================================")
+    print(f" [Backend] Triton Kernels: {'ENABLED' if triton_enabled else 'DISABLED (PyTorch fallback)'}")
+    print(f" [Neuron]  du_du: {args.du_du} | dS_du: {args.dS_du} | custom: {args.use_custom_neuron}")
+    print(f"=======================================================\n")
+
     if args.log_wandb:
         if has_wandb:
                 wandb.init(project=args.dataset.split("/")[-1] , 
-                        name = args.experiment,
+                        name = args.experiment if args.experiment else None,
                         # entity="spikingtransformer",
-                        config=args)
+                        config=dict(**vars(args), triton_enabled=triton_enabled))
                 # Append unique Run ID to experiment name to prevent 
                 # multi-agent race conditions on checkpoint files
                 if hasattr(wandb, 'run') and wandb.run is not None:
@@ -660,10 +666,14 @@ def main():
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
 
+            t_epoch_start = time.perf_counter()
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
                 amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
+            epoch_time_sec = time.perf_counter() - t_epoch_start
+            if args.local_rank == 0:
+                _logger.info(f"Epoch {epoch} training time: {epoch_time_sec:.2f}s")
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                 if args.local_rank == 0:
@@ -679,6 +689,7 @@ def main():
                 if args.log_wandb and has_wandb:
                     wandb.log({
                         "train/loss": train_metrics['loss'],
+                        "train/epoch_time_sec": epoch_time_sec,
                         "val/loss": eval_metrics['loss'],
                         "val/acc_tp1": eval_metrics['top1'],
                         "val/acc_tp5": eval_metrics['top5'],

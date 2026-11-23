@@ -1,0 +1,167 @@
+# =============================================================================
+# Sweep v2: invariant_cgrad with the repaired consistency gate
+#
+#   python -m wandb sweep event_invariant_sweep_v2.yaml
+#   python run_sweep.py <SWEEP_ID>          # GPUS_TO_USE = [4,5,6,7]
+#
+# What changed from event_invariant_sweep.yaml, and why. The v1 sweep ran 141
+# runs / 379 GPU-h and found no hyperparameter that moved the objective. The
+# reason turned out to be mechanical, not statistical:
+#
+#   dL_pred = rho*g_base is O(rho) while m is O(1) -- the reset jump does not
+#   shrink as u1 approaches V_th. The consistency gate
+#   sigmoid(alpha_c*(-m_hat*pred_hat)) therefore has an argument that vanishes
+#   exactly where g_d = sigmoid(beta*(eps-|delta|)) is maximal. Measured:
+#   |-m_hat*pred_hat| < 0.05 for 58.7% of entries, so g_cons sits at ~0.5
+#   (no information) and the gate is ANTI-selective -- 15-21% of fired entries
+#   are genuinely inconsistent against a 28% base rate, i.e. worse than firing
+#   at random. Every v1 hyperparameter tuned *when* an uninformative gate fired.
+#
+# 1. snnbp-consistency is swept, and is the headline variable.
+#      product = Eq. 6 verbatim (v1 behaviour, anti-selective) -- kept as the
+#                within-sweep control so the fix is measured, not assumed
+#      sign    = literal Eq. 10 sign test. 100% selectivity for h >= 0.45 while
+#                still firing on 3-9% of entries.
+#    This is the comparison the sweep exists to make. Everything else is
+#    secondary and should be read conditional on it.
+#
+# 2. snnbp-h is [0.30, 0.60], not [0.30, 0.75]. h is by far the dominant rate
+#    control (Spearman rho = -0.878 with log10 rate in v1; kappa is a distant
+#    -0.255 -- v1's header claimed the opposite and was wrong). Under the sign
+#    gate the measured rates are 18.8% at h=0.30 falling to 0.77% at h=0.60,
+#    with selectivity >= 90% throughout. Above 0.62 the rate drops under 0.5%
+#    and the run is a baseline sample. v1 spent its top third of h there.
+#
+# 3. snnbp-alpha-cons is FIXED at 4.0, not swept. Under the sign gate g_cons
+#    takes only sigmoid(+-alpha_c), so alpha_c does nothing but set the
+#    selectivity threshold sigmoid(-alpha_c)^(1/3). Measured fire/selectivity at
+#    alpha_c = 3/4/6/8 are 8.66/8.96/9.11/9.13% and 99.5% throughout -- inert.
+#    4.0 guarantees perfect selectivity for any h > 0.262, i.e. the whole swept
+#    range. Sweeping an inert parameter is what produced two meaningless rows of
+#    the paper's Table 9; not repeating it.
+#
+# 4. snnbp-correction is swept over blend/mask/flip. v1 could not reach the
+#    endpoints: blend_factor is bounded in (0.5,1] but measures 0.53-0.61 in
+#    practice, so w ~ 0.57*eta and no entry flips sign below eta ~ 0.70. mask
+#    and flip apply the endpoints directly. NOTE eta and gamma are inert for
+#    mask and flip -- those runs carry a sampled eta that does nothing.
+#
+# 5. snnbp-two-sided is swept. This is the one lever on the remaining defect:
+#    with either gate, frac_interventions_m_neg = 0.499, so corrections split
+#    evenly between m>0 and m<0 and cancel in aggregate (mean/sd ~ 0.005).
+#    two_sided=false gates on m rather than |m| and is the only setting that can
+#    break that symmetry. It collapsed to 25.6% in an earlier single run, but
+#    that was with the anti-selective gate; under the sign gate it still fires
+#    at 3.4-8.6% with >=97% selectivity, so it is worth retesting. Expect some
+#    collapsed runs -- that is information, not waste.
+#
+# READ THE RESULTS WITH cgrad/intervention_rate, exactly as before. Any run
+# reporting ~0% trained as plain BPTT and is a baseline sample, not a C-Grad
+# sample. Runs with snnbp-consistency=product are the control arm; do not pool
+# them with sign runs when ranking.
+# =============================================================================
+
+program: train.py
+name: invariant_cgrad_v2_gatefix
+method: random
+
+metric:
+  goal: maximize
+  name: val/mean_last10
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - "--log-wandb"
+  - "--early-stop-patience=-1"
+  - ${args}
+
+parameters:
+  # ---- fixed: task, model, data ------------------------------------------
+  config:
+    value: ./cifar10dvs_invariant.yaml
+  data-path:
+    value: /data/rboone/datasets/wg_dvst
+  model:
+    value: max_former
+  du-du:
+    value: invariant_cgrad
+  dS-du:
+    value: Gamma
+  use-custom-neuron:
+    value: true
+  detach-reset:
+    value: true
+  snnbp-tau:
+    value: 0.5
+
+  # ---- fixed: optimisation ------------------------------------------------
+  # Same as v1 so the two sweeps are directly comparable.
+  epochs:
+    value: 50
+  lr:
+    value: 0.0045
+  weight-decay:
+    value: 0.0079
+
+  # ---- fixed: instrumentation --------------------------------------------
+  log-cgrad-stats:
+    value: true
+  cgrad-stats-prob:
+    value: 0.125
+  metric-window:
+    value: 10
+
+  # ---- fixed: inert under the sign gate (see note 3) ----------------------
+  snnbp-alpha-cons:
+    value: 4.0
+  snnbp-gamma:
+    value: 5.0
+
+  # ---- swept: the headline comparison -------------------------------------
+  snnbp-consistency:
+    values: ["sign", "product"]
+
+  # ---- swept: mechanism ----------------------------------------------------
+  snnbp-correction:
+    values: ["blend", "mask", "flip"]
+  snnbp-two-sided:
+    values: [true, false]
+
+  # ---- swept: rate --------------------------------------------------------
+  # h dominates the intervention rate. Range calibrated on the sign gate so
+  # every sample is live: 18.8% fire at 0.30, 0.77% at 0.60.
+  snnbp-h:
+    distribution: uniform
+    min: 0.30
+    max: 0.60
+
+  # ---- swept: the g_m harmfulness gate ------------------------------------
+  # kappa is the margin on |m_hat|, which runs about 0.5-1.8, so above ~1.75
+  # g_m shuts down regardless of h.
+  snnbp-kappa:
+    distribution: uniform
+    min: 0.25
+    max: 1.75
+  snnbp-alpha:
+    distribution: log_uniform_values
+    min: 0.5
+    max: 4.0
+
+  # ---- swept: the g_d proximity gate --------------------------------------
+  # epsilon is a membrane distance in units of V_th, a genuine physical scale.
+  snnbp-beta:
+    distribution: log_uniform_values
+    min: 1.0
+    max: 4.0
+  snnbp-epsilon:
+    distribution: uniform
+    min: 0.15
+    max: 0.50
+
+  # ---- swept: correction strength (inert for mask/flip) -------------------
+  snnbp-eta:
+    distribution: uniform
+    min: 0.10
+    max: 1.00

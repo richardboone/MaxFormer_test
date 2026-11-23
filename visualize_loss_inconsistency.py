@@ -38,7 +38,7 @@ def main():
     ax.plot(u_above, l_above, color='blue', linewidth=2.5)
     
     # Plot gradient prediction (dashed line)
-    ax.plot(u_tangent, l_tangent, color='red', linestyle='--', linewidth=2, label='Local Linear Estimate1')
+    ax.plot(u_tangent, l_tangent, color='red', linestyle='--', linewidth=2, label='Local Linear Estimate')
     
     # Vertical line at threshold
     ax.axvline(v_th, color='gray', linestyle=':', linewidth=1.5, label='Threshold $V_{th}$')

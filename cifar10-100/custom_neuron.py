@@ -4,6 +4,16 @@ import math
 import os
 from spikingjelly.clock_driven.neuron import MultiStepLIFNode as OriginalLIFNode
 
+try:
+    from triton_neuron import TritonTimeParallel_LIFSpike
+    TRITON_AVAILABLE = True
+except ImportError:
+    try:
+        from .triton_neuron import TritonTimeParallel_LIFSpike
+        TRITON_AVAILABLE = True
+    except ImportError:
+        TRITON_AVAILABLE = False
+
 # --- Global Args Handler ---
 GLOBAL_ARGS = None
 METRICS_COLLECTOR = None
@@ -362,11 +372,7 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
 
             else:
                 # Default LIF
-                if reset_mode == 'soft':
-                    dU2_dU1 = 1 - thresh * dS_dU1
-                else:
-                    dU2_dU1 = (1 - spikes_tensor[t]) - (u1 * dS_dU1)
-                dL_dU1 = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1
+                dL_dU1 = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
 
             # Update for next iteration
             grad_memb_last = dL_dU1
@@ -398,7 +404,9 @@ class LIFSpikeLayer_Cons(nn.Module):
         self.gama = gama
 
     def forward(self, x):
-        # Pass detach_reset to the function
+        use_triton = TRITON_AVAILABLE and x.is_cuda and (os.environ.get('DISABLE_TRITON', '0') != '1')
+        if use_triton:
+            return TritonTimeParallel_LIFSpike.apply(x, self.thresh, self.decay, self.input_scale, self.gama, self.args, self.detach_reset, self.reset_mode)
         return TimeParallel_LIFSpike.apply(x, self.thresh, self.decay, self.input_scale, self.gama, self.args, self.detach_reset, self.reset_mode)
         
 class MultiStepLIFNode(nn.Module):

@@ -1,0 +1,141 @@
+# =============================================================================
+# Stage 0: measure the seed-to-seed standard deviation.
+#
+#   python -m wandb sweep event_stage0_seedvar.yaml
+#   python run_sweep.py <SWEEP_ID>          # GPUS_TO_USE = [4,5,6,7]
+#
+# GRID method, 2 x 8 = exactly 16 runs. Not a search -- every nuisance parameter
+# is pinned so the only things that vary are the arm and the seed.
+#
+# WHY THIS EXISTS. All 80 configs in sweep v2 were distinct; no configuration was
+# ever repeated. So every standard deviation computed from v1 or v2 conflates
+# hyperparameter variance with seed variance, and the required sample size for a
+# confirmatory test is unknown to within a factor of five (n/arm for delta=0.5 at
+# 80% power ranges from 7 to 33 as seed sd ranges 0.30 to 0.652). This sweep
+# measures it. Pooled within-cell sd from v2 was 0.652, which is an UPPER bound.
+#
+# THE TWO ARMS differ only in snnbp-h:
+#
+#   h = 1.01  BASELINE. The intervention signal is a geometric mean of sigmoids
+#             and is therefore bounded above by 1, so the gate can never fire and
+#             dL_dU1 = base_function exactly. Verified max|diff| = 0.000e+00
+#             against all three correction modes.
+#             Do NOT substitute a different du-du value for the baseline: the
+#             fallback branch of custom_neuron.py ignores detach_reset and uses
+#             (1-S) - u1*dS_dU1 where invariant_cgrad uses (1-S). Measured
+#             difference 43.6% relative. It is not a matched control.
+#             This arm emits one "gate unreachable" warning. That is correct.
+#
+#   h = 0.24  C-GRAD at the theory's best operating point: measured 21.7%
+#             EFFECTIVE intervention rate, 100% selectivity, and 27.7% of the
+#             gradient L1 moved. Chosen as the largest perturbation available
+#             while never touching a consistent update.
+#
+# CHECK cgrad/intervention_rate ON THE h=1.01 ARM. It must be exactly 0.0. That
+# is a built-in assertion that the baseline is really ungated; if it is nonzero,
+# something is wrong and the whole comparison is void.
+#
+# NUISANCE PARAMETERS ARE PINNED, NOT SWEPT. In v2 alpha/beta/kappa/epsilon were
+# swept alongside h, so g_m*g_d shut the gate down independently of h and the
+# realised intervention rate became uncontrollable: h in [0.30,0.60] should have
+# spanned 4.6-17.6% but delivered a median of 2.3%, with 36% of sign runs below
+# 1%. The values below keep g_m and g_d permissive so that h alone sets the rate.
+#
+# alpha-cons = 6.0 puts the selectivity boundary sigmoid(-alpha_c)^(1/3) at
+# 0.135, far below the operating h, so selectivity is 100% with headroom.
+#
+# correction = flip because |sign(m)*|bf|| = |bf| exactly: it is the only
+# correction mode that preserves per-entry gradient magnitude, so a difference
+# against the baseline cannot be an effective-learning-rate artifact. eta and
+# gamma are inert under flip and are left at their defaults.
+#
+# CAVEAT ON THE RATE. The 21.7% figure is measured on Gaussian synthetic input.
+# Real gradient distributions differ. Read cgrad/intervention_rate off this sweep
+# and recalibrate h before stage 1 if it lands far from that. Note also that the
+# logged rate currently OVERCOUNTS: 10.6% of neuron-timesteps have
+# base_function == 0 exactly (Gamma surrogate vanishes for |u1-Vth| > gama and
+# (1-S) = 0 when spiking), giving sign(pred) = 0, g_cons = 0.5, and a no-op
+# "intervention". The effective-rate stat is a stage-1 code change.
+#
+# NEXT. Stage 1 adds a rate-matched random-selection control (snnbp-control =
+# randgate) and sizes n from the sd measured here. Two pre-specified comparisons,
+# cgrad-base and cgrad-randgate. Nothing else.
+# Stop rule: if |cgrad - base| > 1.0 here, skip ahead to stage 1 at the implied n.
+# =============================================================================
+
+program: train.py
+name: stage0_seedvar_rerun
+method: grid
+
+metric:
+  goal: maximize
+  name: val/mean_last10
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - "--log-wandb"
+  - "--early-stop-patience=-1"
+  - ${args}
+
+parameters:
+  # ---- the only two things that vary ---------------------------------------
+  snnbp-h:
+    values: [1.01, 0.24]
+  seed:
+    values: [1, 2, 3, 4]
+
+  # ---- task, model, data ----------------------------------------------------
+  config:
+    value: ./cifar10dvs_invariant.yaml
+  data-path:
+    value: /data/rboone/datasets/wg_dvst
+  model:
+    value: max_former
+  du-du:
+    value: invariant_cgrad
+  dS-du:
+    value: Gamma
+  use-custom-neuron:
+    value: true
+  detach-reset:
+    value: true
+  snnbp-tau:
+    value: 0.5
+
+  # ---- optimisation: identical to v1 and v2 so runs remain comparable -------
+  epochs:
+    value: 50
+  lr:
+    value: 0.0045
+  weight-decay:
+    value: 0.0079
+
+  # ---- gate mechanism: pinned ----------------------------------------------
+  snnbp-consistency:
+    value: sign
+  snnbp-correction:
+    value: flip
+  snnbp-two-sided:
+    value: true
+  snnbp-alpha-cons:
+    value: 6.0
+
+  # ---- nuisance gates: pinned so h alone controls the rate -----------------
+  snnbp-alpha:
+    value: 0.51
+  snnbp-beta:
+    value: 2.91
+  snnbp-kappa:
+    value: 0.728
+  snnbp-epsilon:
+    value: 0.470
+
+  # ---- instrumentation ------------------------------------------------------
+  log-cgrad-stats:
+    value: true
+  cgrad-stats-prob:
+    value: 0.125
+  metric-window:
+    value: 10

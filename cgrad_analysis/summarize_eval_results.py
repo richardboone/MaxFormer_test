@@ -15,10 +15,13 @@ ARM_ORDER = [
     "B0_bptt_gamma",
     "B1_impr_harmful_gamma",
     "B2_prior_inv_cgrad",
+    "B3_impr_twosided_gamma",
     "C0_bptt_undetached",
     "C1_impr_undetached",
+    "C2_impr_twosided_undetached",
     "D0_bptt_tau20_scale1",
     "D1_impr_tau20_scale1",
+    "D2_impr_twosided_tau20_scale1",
 ]
 
 ARM_DESCRIPTIONS = {
@@ -28,10 +31,13 @@ ARM_DESCRIPTIONS = {
     "B0_bptt_gamma": "Matched BPTT (eta=0, Gamma, tau=2, coupled, detach=T)",
     "B1_impr_harmful_gamma": "Improved C-Grad (harmful_only=T, Gamma, tau=2, coupled, detach=T)",
     "B2_prior_inv_cgrad": "Prior invariant_cgrad (sign+flip, h=0.24, Gamma, tau=2, detach=T)",
+    "B3_impr_twosided_gamma": "Improved C-Grad (harmful_only=F, Gamma, tau=2, coupled, detach=T)",
     "C0_bptt_undetached": "Matched BPTT (eta=0, sigmoid, tau=2, coupled, detach=F)",
     "C1_impr_undetached": "Improved C-Grad (harmful_only=T, sigmoid, tau=2, coupled, detach=F)",
+    "C2_impr_twosided_undetached": "Improved C-Grad (harmful_only=F, sigmoid, tau=2, coupled, detach=F)",
     "D0_bptt_tau20_scale1": "Matched BPTT (eta=0, sigmoid, tau=20, scale=1.0, detach=F)",
     "D1_impr_tau20_scale1": "Improved C-Grad (harmful_only=T, sigmoid, tau=20, scale=1.0, detach=F)",
+    "D2_impr_twosided_tau20_scale1": "Improved C-Grad (harmful_only=F, sigmoid, tau=20, scale=1.0, detach=F)",
 }
 
 PAIRED_CONTRASTS = [
@@ -39,12 +45,22 @@ PAIRED_CONTRASTS = [
     ("A2_impr_twosided_sig", "A0_bptt_sig", "Improved C-Grad (two-sided) vs Matched BPTT [sigmoid]"),
     ("A2_impr_twosided_sig", "A1_impr_harmful_sig", "Two-sided vs Harmful-only gating [sigmoid]"),
     ("B1_impr_harmful_gamma", "B0_bptt_gamma", "Improved C-Grad (harmful) vs Matched BPTT [Gamma]"),
-    ("B1_impr_harmful_gamma", "B2_prior_inv_cgrad", "Improved C-Grad vs Prior invariant_cgrad [Gamma]"),
+    ("B3_impr_twosided_gamma", "B0_bptt_gamma", "Improved C-Grad (two-sided) vs Matched BPTT [Gamma]"),
+    ("B3_impr_twosided_gamma", "B1_impr_harmful_gamma", "Two-sided vs Harmful-only gating [Gamma]"),
+    ("B1_impr_harmful_gamma", "B2_prior_inv_cgrad", "Improved C-Grad (harmful) vs Prior invariant_cgrad [Gamma]"),
+    ("B3_impr_twosided_gamma", "B2_prior_inv_cgrad", "Improved C-Grad (two-sided) vs Prior invariant_cgrad [Gamma]"),
     ("C0_bptt_undetached", "A0_bptt_sig", "detach_reset=False vs True [BPTT, sigmoid]"),
-    ("C1_impr_undetached", "C0_bptt_undetached", "Improved C-Grad vs Matched BPTT [detach_reset=False]"),
+    ("C1_impr_undetached", "C0_bptt_undetached", "Improved C-Grad (harmful) vs Matched BPTT [detach_reset=False]"),
+    ("C2_impr_twosided_undetached", "C0_bptt_undetached", "Improved C-Grad (two-sided) vs Matched BPTT [detach_reset=False]"),
+    ("C2_impr_twosided_undetached", "C1_impr_undetached", "Two-sided vs Harmful-only gating [detach_reset=False]"),
+    ("C2_impr_twosided_undetached", "A2_impr_twosided_sig", "detach_reset=False vs True [Improved C-Grad two-sided]"),
     ("D0_bptt_tau20_scale1", "C0_bptt_undetached", "tau=20/scale=1.0 vs tau=2/coupled [BPTT, detach=F]"),
-    ("D1_impr_tau20_scale1", "D0_bptt_tau20_scale1", "Improved C-Grad vs Matched BPTT [tau=20, scale=1.0]"),
+    ("D1_impr_tau20_scale1", "D0_bptt_tau20_scale1", "Improved C-Grad (harmful) vs Matched BPTT [tau=20, scale=1.0]"),
+    ("D2_impr_twosided_tau20_scale1", "D0_bptt_tau20_scale1", "Improved C-Grad (two-sided) vs Matched BPTT [tau=20, scale=1.0]"),
+    ("D2_impr_twosided_tau20_scale1", "D1_impr_tau20_scale1", "Two-sided vs Harmful-only gating [tau=20, scale=1.0]"),
+    ("D2_impr_twosided_tau20_scale1", "C2_impr_twosided_undetached", "tau=20/scale=1.0 vs tau=2/coupled [Improved C-Grad two-sided]"),
     ("A0_bptt_sig", "B0_bptt_gamma", "Surrogate sigmoid vs Gamma [BPTT]"),
+    ("A2_impr_twosided_sig", "B3_impr_twosided_gamma", "Surrogate sigmoid vs Gamma [Improved C-Grad two-sided]"),
 ]
 
 T_CRIT_95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306}

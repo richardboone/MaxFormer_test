@@ -376,6 +376,24 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, header='Test
     return loss, acc1, acc5
 
 
+class _CachedDataset(torch.utils.data.Dataset):
+    """Lazily caches deterministic split samples in host RAM to avoid worker forks."""
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self._cache = [None] * len(dataset)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self._cache[idx]
+        if item is None:
+            item = self.dataset[idx]
+            self._cache[idx] = item
+        return item
+
+
 def load_data(dataset, dataset_dir, distributed, T):
     # Data loading code
     print("Loading data")
@@ -505,6 +523,8 @@ def main(args):
 
     data_path = args.data_path
     dataset_train, dataset_test, train_sampler, test_sampler = load_data(args.dataset, data_path, args.distributed, args.T)
+    if len(dataset_test) <= 2000:
+        dataset_test = _CachedDataset(dataset_test)
     data_loader = torch.utils.data.DataLoader(
         dataset=dataset_train,
         batch_size=args.batch_size,
@@ -518,10 +538,10 @@ def main(args):
         dataset=dataset_test,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.workers,
+        num_workers=0,
         drop_last=False,
         pin_memory=True,
-        persistent_workers=True if args.workers > 0 else False)
+        persistent_workers=False)
 
     model = create_model(
         args.model, in_channels=2, num_classes=args.num_classes,

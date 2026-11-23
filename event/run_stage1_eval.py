@@ -96,6 +96,19 @@ ARMS = [
         ],
     },
     {
+        "name": "B3_impr_twosided_gamma",
+        "config": "./cifar10dvs_improved_cgrad.yaml",
+        "flags": [
+            "--du-du=improved_cgrad",
+            "--dS-du=Gamma",
+            "--snnbp-tau=2.0",
+            "--snnbp-input-scale=coupled",
+            "--detach-reset=True",
+            "--snnbp-eta=1.0",
+            "--snnbp-harmful-only=False",
+        ],
+    },
+    {
         "name": "C0_bptt_undetached",
         "config": "./cifar10dvs_improved_cgrad.yaml",
         "flags": [
@@ -118,6 +131,19 @@ ARMS = [
             "--detach-reset=False",
             "--snnbp-eta=1.0",
             "--snnbp-harmful-only=True",
+        ],
+    },
+    {
+        "name": "C2_impr_twosided_undetached",
+        "config": "./cifar10dvs_improved_cgrad.yaml",
+        "flags": [
+            "--du-du=improved_cgrad",
+            "--dS-du=sigmoid",
+            "--snnbp-tau=2.0",
+            "--snnbp-input-scale=coupled",
+            "--detach-reset=False",
+            "--snnbp-eta=1.0",
+            "--snnbp-harmful-only=False",
         ],
     },
     {
@@ -145,29 +171,53 @@ ARMS = [
             "--snnbp-harmful-only=True",
         ],
     },
+    {
+        "name": "D2_impr_twosided_tau20_scale1",
+        "config": "./cifar10dvs_improved_cgrad.yaml",
+        "flags": [
+            "--du-du=improved_cgrad",
+            "--dS-du=sigmoid",
+            "--snnbp-tau=20.0",
+            "--snnbp-input-scale=1.0",
+            "--detach-reset=False",
+            "--snnbp-eta=1.0",
+            "--snnbp-harmful-only=False",
+        ],
+    },
 ]
 
 
 def query_gpu_stats():
-    out = subprocess.check_output(
-        [
-            "nvidia-smi",
-            "--query-gpu=index,memory.used,utilization.gpu",
-            "--format=csv,noheader,nounits",
-        ],
-        text=True,
-    )
-    stats = {}
-    for line in out.strip().splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) == 3:
-            idx, mem_mb, util = int(parts[0]), int(parts[1]), int(parts[2])
-            stats[idx] = (mem_mb, util)
-    return stats
+    for attempt in range(3):
+        try:
+            out = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,memory.used,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                text=True,
+                timeout=15,
+            )
+            stats = {}
+            for line in out.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) == 3:
+                    idx, mem_mb, util = int(parts[0]), int(parts[1]), int(parts[2])
+                    stats[idx] = (mem_mb, util)
+            if stats:
+                return stats
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
+        if attempt < 2:
+            time.sleep(2.0)
+    return {}
 
 
 def pick_free_gpu(active_jobs, candidate_gpus):
     stats = query_gpu_stats()
+    if not stats:
+        return None, 0, 0
     busy_ours = {job["gpu"] for job in active_jobs}
     external_busy = 0
     for idx, (mem_mb, util) in stats.items():
@@ -210,9 +260,12 @@ def write_json_atomic(path, payload):
 def log_msg(master_log_path, msg):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
-    print(line, flush=True)
     with open(master_log_path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+    try:
+        print(line, flush=True)
+    except OSError:
+        pass
 
 
 def load_summary_status(summary_path):
@@ -246,6 +299,7 @@ def both_prior_seeds_collapsed(arm_name, seed, seeds, summaries_dir):
 
 def main():
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
     parser = argparse.ArgumentParser(description="Stage 1 CIFAR10-DVS Evaluation Scheduler")
     parser.add_argument("--data-path", default="/data/rboone/datasets/wg_dvst")
@@ -257,6 +311,7 @@ def main():
     parser.add_argument("--cgrad-stats-prob", type=float, default=0.02)
     parser.add_argument("--out-dir", default="./logs/stage1_eval")
     parser.add_argument("--arms", default="", help="Optional comma-separated subset of arm names")
+    parser.add_argument("--stall-timeout", type=int, default=900, help="Seconds of log inactivity before killing stalled run")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--dry-run", action="store_true")
     cli = parser.parse_args()
@@ -314,15 +369,41 @@ def main():
     failed_list = []
 
     while tasks or active_jobs:
-        # Poll finished jobs
+        # Poll finished or stalled jobs
         still_active = []
+        now = time.time()
         for job in active_jobs:
+            t = job["task"]
             ret = job["proc"].poll()
+            if ret is None and cli.stall_timeout > 0:
+                last_activity = job["launch_time"]
+                if os.path.exists(t["log_path"]):
+                    last_activity = max(last_activity, os.path.getmtime(t["log_path"]))
+                idle = now - last_activity
+                if idle > cli.stall_timeout:
+                    log_msg(
+                        master_log,
+                        f"STALL {t['exp_name']} on GPU {job['gpu']} (idle {idle:.0f}s > {cli.stall_timeout}s) — killing process group",
+                    )
+                    try:
+                        os.killpg(job["proc"].pid, signal.SIGTERM)
+                        job["proc"].wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(job["proc"].pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            job["proc"].wait(timeout=10)
+                        except Exception:
+                            pass
+                    except ProcessLookupError:
+                        pass
+                    ret = -99
             if ret is None:
                 still_active.append(job)
                 continue
             job["log_fp"].close()
-            t = job["task"]
             summary = load_summary_status(t["summary_path"])
             st = summary.get("status") if summary else ("completed" if ret == 0 else "failed")
             if ret == 0 and st == "completed":
@@ -337,12 +418,12 @@ def main():
                 log_msg(master_log, f"NAN   {t['exp_name']} on GPU {job['gpu']} (recorded as nan_collapsed)")
                 completed_list.append(t["exp_name"])
             else:
-                if t["retries"] < 1:
+                if t["retries"] < 2:
                     t["retries"] += 1
-                    log_msg(master_log, f"RETRY {t['exp_name']} after exit={ret} on GPU {job['gpu']}")
+                    log_msg(master_log, f"RETRY {t['exp_name']} after exit={ret} on GPU {job['gpu']} (attempt {t['retries'] + 1})")
                     tasks.insert(0, t)
                 else:
-                    log_msg(master_log, f"FAIL  {t['exp_name']} permanently after retry (exit={ret})")
+                    log_msg(master_log, f"FAIL  {t['exp_name']} permanently after retries (exit={ret})")
                     failed_list.append(t["exp_name"])
         active_jobs = still_active
 
@@ -405,7 +486,7 @@ def main():
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-            active_jobs.append({"task": t, "proc": proc, "gpu": gpu_id, "log_fp": log_fp})
+            active_jobs.append({"task": t, "proc": proc, "gpu": gpu_id, "log_fp": log_fp, "launch_time": time.time()})
             log_msg(
                 master_log,
                 f"START {t['exp_name']} on GPU {gpu_id} (active={len(active_jobs)}/{max_slots}, ext_busy={ext_busy})",

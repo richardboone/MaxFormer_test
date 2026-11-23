@@ -1,4 +1,4 @@
-#!/usr/bin/env python3best_epoch
+#!/usr/bin/env python3
 # This is a slightly modified version of timm's training script
 """ Spikformer ImageNet Testing Script
 
@@ -16,6 +16,7 @@ NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
 Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
 import argparse
+import json
 import time
 import yaml
 import os
@@ -348,20 +349,41 @@ parser.add_argument('--log-wandb', action='store_true', default=False,
 #Extra consistency parameters
 parser.add_argument('--du-du', type=str, default='complex54', help='Feedback gradient mode')
 parser.add_argument('--dS-du', type=str, default='Gamma', help='Surrogate gradient mode')
-parser.add_argument('--snnbp-alpha', type=float, default=1.1742)
-parser.add_argument('--snnbp-beta', type=float, default=0.9245)
-parser.add_argument('--snnbp-epsilon', type=float, default=0.3468)
-parser.add_argument('--snnbp-p', type=float, default=9.5334)
+parser.add_argument('--snnbp-alpha', type=float, default=None)
+parser.add_argument('--snnbp-beta', type=float, default=None)
+parser.add_argument('--snnbp-epsilon', type=float, default=None)
+parser.add_argument('--snnbp-p', type=float, default=None)
 parser.add_argument('--snnbp-k-dir', type=float, default=1.0)
-parser.add_argument('--snnbp-tau', type=float, default=0.5, help='Decay factor (0.5 ~= tau 2.0)')
-# New hyperparameters for stabilized gradient methods
+parser.add_argument('--snnbp-tau', type=float, default=0.5, help='Decay factor (<1.0) or time constant tau (>=1.0)')
+parser.add_argument('--snnbp-input-scale', type=str, default=None, help='Input scaling ("coupled"/"1/tau" or float)')
+# New hyperparameters for stabilized / invariant / improved gradient methods
 parser.add_argument('--snnbp-max-ratio', type=float, default=3.0, help='stable_cgrad: max gradient multiplier vs base')
 parser.add_argument('--snnbp-decay', type=float, default=0.5, help='adaptive_cgrad: trust decay for large base gradients')
-parser.add_argument('--snnbp-intervention', type=float, default=0.8, help='conservative_cgrad: confidence threshold for intervention')
+parser.add_argument('--snnbp-intervention', type=float, default=None, help='confidence threshold h for intervention')
+parser.add_argument('--snnbp-eta', type=float, default=None, help='correction strength eta (0.0 recovers plain BPTT)')
+parser.add_argument('--snnbp-norm', type=str, default=None, choices=['local', 'rms', 'none'], help='improved_cgrad: normalization mode')
+parser.add_argument('--snnbp-harmful-only', type=str2bool, default=None, help='improved_cgrad: gate only on m_eff > 0 instead of |m_eff|')
+parser.add_argument('--snnbp-alpha-mis', type=float, default=None, help='improved_cgrad: misalignment gate steepness')
+parser.add_argument('--snnbp-margin-m', type=float, default=None, help='improved_cgrad: normalized harmfulness margin')
+parser.add_argument('--snnbp-gamma-sharp', type=float, default=None, help='improved_cgrad: sharpness around threshold h (0 = smooth product)')
+parser.add_argument('--snnbp-corr-scale', type=float, default=None, help='improved_cgrad: relative correction magnitude scale')
+parser.add_argument('--snnbp-alpha-cons', type=float, default=2.0, help='invariant_cgrad: consistency gate steepness')
+parser.add_argument('--snnbp-kappa', type=float, default=1.0, help='invariant_cgrad: relative harmfulness margin')
+parser.add_argument('--snnbp-h', type=float, default=0.5, help='invariant_cgrad: intervention threshold')
+parser.add_argument('--snnbp-gamma', type=float, default=5.0, help='invariant_cgrad: blend sharpness around h')
+parser.add_argument('--snnbp-two-sided', type=str2bool, default=True, help='invariant_cgrad: gate on |m| rather than m')
+parser.add_argument('--snnbp-consistency', type=str, default='product', choices=['product', 'ref', 'sign'])
+parser.add_argument('--snnbp-correction', type=str, default='blend', choices=['blend', 'mask', 'flip'])
+parser.add_argument('--log-cgrad-stats', type=str2bool, default=False, help='accumulate and log intervention rate statistics')
+parser.add_argument('--cgrad-stats-prob', type=float, default=0.05, help='fraction of layer calls sampled for --log-cgrad-stats')
+parser.add_argument('--metric-window', type=int, default=10, help='window k for val/mean_last{k}')
+parser.add_argument('--summary-json', type=str, default='', help='optional path to write atomic JSON run summary')
 parser.add_argument('--gama', type=float, default=1.0)
 parser.add_argument('--use-custom-neuron', type=str2bool, nargs='?', const=True, default=True, help='Use custom neuron implementation')
 parser.add_argument('--surrogate-alpha', type=float, default=4.0, 
                     help='Alpha parameter for sigmoid surrogate gradient')
+parser.add_argument('--surrogate-gamma', type=float, default=None,
+                    help='Gamma width parameter for Gamma surrogate gradient')
 parser.add_argument('--detach-reset', type=str2bool, default=True, help='Detach reset gradient')
 parser.add_argument('--reset-mode', type=str, default='hard', choices=['hard', 'soft'],
                     help='LIF neuron reset mode: hard (multiply by 1-S) or soft (subtract V_th*S)')
@@ -372,7 +394,8 @@ def _parse_args():
     if args_config.config:
         with open(args_config.config, 'r') as f:
             cfg = yaml.safe_load(f)
-            parser.set_defaults(**cfg)
+            cfg_cleaned = {k.replace('-', '_'): v for k, v in cfg.items()}
+            parser.set_defaults(**cfg_cleaned)
 
     # The main arg parser parses the rest of the args, the usual
     # defaults will have been overridden if config file specified.
@@ -383,6 +406,16 @@ def _parse_args():
     return args, args_text
 
 max_accuracy = 0.0
+
+
+def _write_json_atomic(path, payload):
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
+
 
 def main():
     setup_default_logging()
@@ -395,20 +428,45 @@ def main():
     print(f" [Neuron]  du_du: {args.du_du} | dS_du: {args.dS_du} | custom: {args.use_custom_neuron}")
     print(f"=======================================================\n")
 
+    wandb_active = False
     if args.log_wandb:
         if has_wandb:
-                wandb.init(project=args.dataset.split("/")[-1] , 
-                        name = args.experiment if args.experiment else None,
-                        # entity="spikingtransformer",
-                        config=dict(**vars(args), triton_enabled=triton_enabled))
-                # Append unique Run ID to experiment name to prevent 
-                # multi-agent race conditions on checkpoint files
-                if hasattr(wandb, 'run') and wandb.run is not None:
-                    args.experiment = f"{args.experiment}_{wandb.run.id}"
-
+            wandb_cfg = dict(**vars(args), triton_enabled=triton_enabled)
+            try:
+                wandb.init(
+                    project=args.dataset.split("/")[-1],
+                    name=args.experiment if args.experiment else None,
+                    config=wandb_cfg,
+                )
+                wandb_active = True
+            except Exception as exc:
+                _logger.warning(f"wandb online init failed ({exc}); falling back to offline mode.")
+                try:
+                    wandb.init(
+                        project=args.dataset.split("/")[-1],
+                        name=args.experiment if args.experiment else None,
+                        config=wandb_cfg,
+                        mode="offline",
+                    )
+                    wandb_active = True
+                except Exception as exc2:
+                    _logger.warning(f"wandb offline init also failed ({exc2}); continuing without wandb.")
+            # Append unique Run ID to experiment name to prevent
+            # multi-agent race conditions on checkpoint files
+            if wandb_active and hasattr(wandb, 'run') and wandb.run is not None:
+                args.experiment = f"{args.experiment}_{wandb.run.id}"
         else:
             _logger.warning("You've requested to log metrics to wandb but package not found. "
                             "Metrics not being logged to wandb, try `pip install wandb`")
+
+    summary_path = args.summary_json
+    if not summary_path and args.experiment:
+        summary_path = os.path.join("./logs/eval_summaries", f"{args.experiment}.json")
+    epochs_jsonl_path = None
+    if summary_path:
+        stem = summary_path[:-5] if summary_path.endswith(".json") else summary_path
+        epochs_jsonl_path = f"{stem}.epochs.jsonl"
+        os.makedirs(os.path.dirname(os.path.abspath(summary_path)), exist_ok=True)
 
     args.prefetcher = not args.no_prefetcher
     args.device = 'cuda:0'
@@ -416,6 +474,9 @@ def main():
     args.rank = 0  # global rank
     args.local_rank=0
     args.distributed = False
+
+    if args.log_cgrad_stats:
+        custom_neuron.enable_cgrad_stats(torch.device(args.device), sample_prob=args.cgrad_stats_prob)
 
     # resolve AMP arguments based on PyTorch / Apex availability
     use_amp = None
@@ -443,11 +504,6 @@ def main():
             embed_dims=args.dim,  mlp_ratios=args.mlp_ratio, drop_rate=0., 
             depths=args.layer, T=args.time_step, 
         )
-    model = create_model(
-        args.model, in_channels=3, num_classes=args.num_classes, 
-        embed_dims=args.dim,  mlp_ratios=args.mlp_ratio, drop_rate=0., 
-        depths=args.layer, T=args.time_step, 
-    )
     print("Creating model")
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"number of params: {n_parameters}")
@@ -661,6 +717,17 @@ def main():
         with open(os.path.join(output_dir, 'args.yaml'), 'w') as f:
             f.write(args_text)
 
+    global max_accuracy
+    max_accuracy = 0.0
+    val_acc_history = []
+    epoch_times = []
+    cgrad_stats_history = []
+    val_mean_last_k = 0.0
+    final_val_acc1 = 0.0
+    epochs_completed = 0
+    run_status = "running"
+    run_error = None
+
     try:
         for epoch in range(start_epoch, num_epochs):
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
@@ -672,6 +739,7 @@ def main():
                 lr_scheduler=lr_scheduler, saver=saver, output_dir=output_dir,
                 amp_autocast=amp_autocast, loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn)
             epoch_time_sec = time.perf_counter() - t_epoch_start
+            epoch_times.append(epoch_time_sec)
             if args.local_rank == 0:
                 _logger.info(f"Epoch {epoch} training time: {epoch_time_sec:.2f}s")
 
@@ -682,21 +750,6 @@ def main():
 
             eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
 
-            if args.local_rank == 0:
-                global max_accuracy
-                # get max_acc for deciding save checkpoint or not
-                max_accuracy = max(max_accuracy, eval_metrics['top1'])
-                if args.log_wandb and has_wandb:
-                    wandb.log({
-                        "train/loss": train_metrics['loss'],
-                        "train/epoch_time_sec": epoch_time_sec,
-                        "val/loss": eval_metrics['loss'],
-                        "val/acc_tp1": eval_metrics['top1'],
-                        "val/acc_tp5": eval_metrics['top5'],
-                        "val/max": max_accuracy,
-                        "lr":  float(optimizer.param_groups[0]['lr']),
-                    }, step = epoch)
-
             if model_ema is not None and not args.model_ema_force_cpu:
                 if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                     distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
@@ -705,6 +758,42 @@ def main():
                     log_suffix=' (EMA)')
                 eval_metrics = ema_eval_metrics
 
+            cgrad_stats = custom_neuron.pop_cgrad_stats()
+            if cgrad_stats is not None:
+                cgrad_stats_history.append(cgrad_stats)
+
+            if args.local_rank == 0:
+                max_accuracy = max(max_accuracy, eval_metrics['top1'])
+                val_acc_history.append(eval_metrics['top1'])
+                final_val_acc1 = eval_metrics['top1']
+                epochs_completed = len(val_acc_history)
+                k = args.metric_window
+                val_mean_last_k = sum(val_acc_history[-k:]) / len(val_acc_history[-k:])
+
+                log_payload = {
+                    "train/loss": train_metrics['loss'],
+                    "train/epoch_time_sec": epoch_time_sec,
+                    "val/loss": eval_metrics['loss'],
+                    "val/acc_tp1": eval_metrics['top1'],
+                    "val/acc_tp5": eval_metrics['top5'],
+                    "val/max": max_accuracy,
+                    f"val/mean_last{k}": val_mean_last_k,
+                    "lr": float(optimizer.param_groups[0]['lr']),
+                }
+                if cgrad_stats is not None:
+                    log_payload.update(cgrad_stats)
+
+                if epochs_jsonl_path:
+                    epoch_rec = dict(epoch=epoch, **log_payload)
+                    with open(epochs_jsonl_path, 'a', encoding='utf-8') as jf:
+                        jf.write(json.dumps(epoch_rec) + "\n")
+
+                if wandb_active:
+                    try:
+                        wandb.log(log_payload, step=epoch)
+                    except Exception as exc:
+                        _logger.warning(f"wandb.log failed at epoch {epoch}: {exc}")
+
             if lr_scheduler is not None:
                 # step LR for next epoch
                 lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
@@ -712,7 +801,7 @@ def main():
             if output_dir is not None:
                 update_summary(
                     epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
-                    write_header=best_metric is None, log_wandb=args.log_wandb and has_wandb)
+                    write_header=best_metric is None, log_wandb=wandb_active)
 
             if saver is not None:
                 # save proper checkpoint with eval metric
@@ -728,8 +817,50 @@ def main():
                 best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
                 _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
 
+        run_status = "completed"
     except KeyboardInterrupt:
-        pass
+        run_status = "interrupted"
+    except Exception as exc:
+        run_error = f"{type(exc).__name__}: {exc}"
+        run_status = "failed"
+        raise
+    finally:
+        if summary_path and args.local_rank == 0:
+            cgrad_stats_mean = {}
+            if cgrad_stats_history:
+                all_keys = sorted(cgrad_stats_history[0].keys())
+                for key in all_keys:
+                    vals = [d[key] for d in cgrad_stats_history if key in d]
+                    if key.endswith('neuron_timesteps_sampled'):
+                        cgrad_stats_mean[key] = float(sum(vals))
+                    else:
+                        cgrad_stats_mean[key] = float(sum(vals) / len(vals))
+            summary_payload = {
+                "status": run_status,
+                "error": run_error,
+                "experiment": args.experiment,
+                "dataset": args.dataset,
+                "model": args.model,
+                "seed": args.seed,
+                "triton_enabled": triton_enabled,
+                "epochs_completed": epochs_completed,
+                "total_epochs": num_epochs,
+                "metric_window": args.metric_window,
+                "max_val_acc1": float(max_accuracy),
+                "val_mean_last_k": float(val_mean_last_k),
+                f"val_mean_last{args.metric_window}": float(val_mean_last_k),
+                "final_val_acc1": float(final_val_acc1),
+                "mean_epoch_time_sec": float(sum(epoch_times) / len(epoch_times)) if epoch_times else 0.0,
+                "cgrad_stats_mean": cgrad_stats_mean,
+                "args": vars(args),
+            }
+            _write_json_atomic(summary_path, summary_payload)
+        if wandb_active:
+            try:
+                wandb.finish()
+            except Exception as exc:
+                _logger.warning(f"wandb.finish failed: {exc}")
+
     if best_metric is not None:
         _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
 

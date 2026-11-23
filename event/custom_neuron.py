@@ -1,9 +1,17 @@
-import torch
-import torch.nn as nn
+import copy
 import math
 import os
 import random
-from spikingjelly.clock_driven.neuron import MultiStepLIFNode as OriginalLIFNode
+import torch
+import torch.nn as nn
+
+try:
+    from spikingjelly.clock_driven.neuron import MultiStepLIFNode as OriginalLIFNode
+except ImportError:
+    try:
+        from spikingjelly.activation_based.neuron import LIFNode as OriginalLIFNode
+    except ImportError:
+        OriginalLIFNode = None
 
 try:
     from triton_neuron import TritonTimeParallel_LIFSpike
@@ -13,48 +21,86 @@ except ImportError:
         from .triton_neuron import TritonTimeParallel_LIFSpike
         TRITON_AVAILABLE = True
     except ImportError:
+        TritonTimeParallel_LIFSpike = None
         TRITON_AVAILABLE = False
 
 # --- Global Args Handler ---
 GLOBAL_ARGS = None
+METRICS_COLLECTOR = None
+DISABLE_CUPY = os.environ.get('DISABLE_CUPY', '0') == '1'
 _INVARIANT_GATE_CHECKED = False
+
 
 def set_global_args(args):
     global GLOBAL_ARGS
     GLOBAL_ARGS = args
 
 
+def set_metrics_collector(collector):
+    global METRICS_COLLECTOR
+    METRICS_COLLECTOR = collector
+
+
+def _get_arg(args, name, default):
+    if args is None:
+        return default
+    val = getattr(args, name, None)
+    return default if val is None else val
+
+
+def _resolve_tau_and_scale(tau, input_scale, args):
+    """Resolve (decay, eff_input_scale) from layer defaults and optional Namespace overrides."""
+    eff_tau = float(tau)
+    raw_tau = _get_arg(args, 'snnbp_tau', None)
+    if raw_tau is not None:
+        raw_tau = float(raw_tau)
+        if 0.0 < raw_tau < 1.0:
+            # Compatibility with repo convention where snnbp_tau < 1.0 is decay factor
+            decay = raw_tau
+            eff_tau = 1.0 / (1.0 - decay)
+        else:
+            eff_tau = raw_tau
+            decay = 1.0 - (1.0 / eff_tau)
+    else:
+        decay = 1.0 - (1.0 / eff_tau)
+
+    raw_scale = _get_arg(args, 'snnbp_input_scale', None)
+    if raw_scale is not None:
+        if raw_scale in ('1/tau', 'coupled'):
+            eff_scale = 1.0 - decay
+        else:
+            eff_scale = float(raw_scale)
+    elif input_scale in ('1/tau', 'coupled'):
+        eff_scale = 1.0 - decay
+    else:
+        eff_scale = float(input_scale)
+
+    return decay, eff_scale
+
+
 # --- C-Grad intervention statistics -----------------------------------------
-# Off by default. When enabled, invariant_cgrad accumulates how often it actually
-# intervenes. This matters for hyperparameter sweeps: a configuration whose gate
-# never opens trains as plain BPTT, scores like the baseline, and is otherwise
-# indistinguishable from a genuinely good configuration -- so without this metric
-# a sweep cannot tell "good hyperparameters" from "did nothing".
-#
-# All accumulation stays on-device so the backward pass never blocks on a host
-# sync; the single sync happens in pop_cgrad_stats() once per epoch. Collection is
-# sampled (see enable_cgrad_stats) to keep the cost off the critical path.
 _CGRAD_STATS = None
-_CGRAD_STATS_P = 0.125      # sampling probability per backward call
-_CGRAD_TOTAL = 0.0          # kept on the host: numel needs no kernel
+_CGRAD_STATS_P = 0.05
+_CGRAD_TOTAL = 0.0
 
-_STAT_KEYS = ('fired', 'm_neg', 'signal_sum', 'near_thresh')
+_STAT_KEYS = (
+    'fired',
+    'effective_fired',
+    'm_neg',
+    'effective_m_neg',
+    'signal_sum',
+    'weight_sum',
+    'near_thresh',
+)
 
 
-def enable_cgrad_stats(device, sample_prob=0.125):
-    """Start collecting intervention statistics.
-
-    Statistics are gathered on a random `sample_prob` fraction of backward calls.
-    A training run touches hundreds of millions of neuron-timesteps, so an eighth
-    of them estimates the intervention rate to far better precision than needed,
-    at roughly an eighth of the cost. Sampling is random rather than strided
-    because a fixed stride can alias against the number of neuron layers per step
-    and silently always sample the same layers.
-    """
+def enable_cgrad_stats(device, sample_prob=0.05):
+    """Start collecting C-Grad intervention statistics on-device with zero per-step CPU sync."""
     global _CGRAD_STATS, _CGRAD_STATS_P, _CGRAD_TOTAL
-    _CGRAD_STATS = {k: torch.zeros((), device=device, dtype=torch.float64)
-                    for k in _STAT_KEYS}
-    _CGRAD_STATS_P = sample_prob
+    _CGRAD_STATS = {
+        k: torch.zeros((), device=device, dtype=torch.float64) for k in _STAT_KEYS
+    }
+    _CGRAD_STATS_P = float(sample_prob)
     _CGRAD_TOTAL = 0.0
 
 
@@ -65,25 +111,25 @@ def disable_cgrad_stats():
 
 
 def pop_cgrad_stats():
-    """Return accumulated statistics as plain floats and reset the counters.
-
-    Returns None when collection is disabled or nothing was sampled. Performs one
-    device->host sync, once per epoch.
-    """
+    """Return accumulated statistics as plain floats and reset counters."""
     global _CGRAD_TOTAL
     if _CGRAD_STATS is None or _CGRAD_TOTAL == 0:
         return None
     total = _CGRAD_TOTAL
     fired = _CGRAD_STATS['fired'].item()
+    eff_fired = _CGRAD_STATS['effective_fired'].item()
     out = {
         'cgrad/intervention_rate': fired / total,
+        'cgrad/effective_rate': eff_fired / total,
         'cgrad/mean_signal': _CGRAD_STATS['signal_sum'].item() / total,
+        'cgrad/mean_w': _CGRAD_STATS['weight_sum'].item() / total,
         'cgrad/near_threshold_rate': _CGRAD_STATS['near_thresh'].item() / total,
-        # Fraction of interventions that act on a crossing predicted to REDUCE
-        # loss. Sec 6.1 says these should not occur; in practice they are about
-        # half of all interventions, and suppressing them collapses training.
-        'cgrad/frac_interventions_m_neg':
-            (_CGRAD_STATS['m_neg'].item() / fired) if fired > 0 else 0.0,
+        'cgrad/frac_interventions_m_neg': (
+            _CGRAD_STATS['m_neg'].item() / fired if fired > 0 else 0.0
+        ),
+        'cgrad/frac_effective_m_neg': (
+            _CGRAD_STATS['effective_m_neg'].item() / eff_fired if eff_fired > 0 else 0.0
+        ),
         'cgrad/neuron_timesteps_sampled': total,
     }
     for k in _STAT_KEYS:
@@ -92,32 +138,26 @@ def pop_cgrad_stats():
     return out
 
 
-def _accumulate_cgrad_stats(do_intervene, signal, m, near_thresh):
-    """Accumulate on-device; no host sync, no effect on the returned gradient.
-
-    Reductions run in fp32 rather than fp64: every accumulated quantity is either
-    a count or a sum of values in [0,1], so fp32 is exact for counts up to 2**24
-    and the fp64 scalar accumulators still carry the running totals.
-    """
+def _accumulate_cgrad_stats(active, weight, signal, m, near_thresh, base_function):
+    """Accumulate stats on-device without CPU sync or gradient side effects."""
     global _CGRAD_TOTAL
     s = _CGRAD_STATS
-    s['fired'] += do_intervene.sum(dtype=torch.float32)
-    s['m_neg'] += (do_intervene * (m < 0)).sum(dtype=torch.float32)
-    s['signal_sum'] += signal.sum(dtype=torch.float32)
-    s['near_thresh'] += near_thresh.sum(dtype=torch.float32)
-    _CGRAD_TOTAL += float(do_intervene.numel())
+    active_f = active.to(torch.float32)
+    nonzero_base = (base_function != 0).to(torch.float32)
+    eff_active = active_f * nonzero_base
+    m_neg_f = (m < 0).to(torch.float32)
+    s['fired'] += active_f.sum(dtype=torch.float32)
+    s['effective_fired'] += eff_active.sum(dtype=torch.float32)
+    s['m_neg'] += (active_f * m_neg_f).sum(dtype=torch.float32)
+    s['effective_m_neg'] += (eff_active * m_neg_f).sum(dtype=torch.float32)
+    s['signal_sum'] += signal.to(torch.float32).sum(dtype=torch.float32)
+    s['weight_sum'] += weight.to(torch.float32).sum(dtype=torch.float32)
+    s['near_thresh'] += near_thresh.to(torch.float32).sum(dtype=torch.float32)
+    _CGRAD_TOTAL += float(active.numel())
 
 
 def _check_invariant_gate_reachable(alpha_d, epsilon, h):
-    """Warn once if invariant_cgrad is configured so that it can never intervene.
-
-    The intervention signal is the geometric mean of three gates, and g_d cannot
-    exceed sigmoid(alpha_d*epsilon), so the signal is capped at
-    sigmoid(alpha_d*epsilon)**(1/3). An h at or above that cap makes the mode a
-    silent no-op -- it trains, it converges, and it is simply standard BPTT.
-    conservative_cgrad has this failure mode with the benchmark defaults and gives
-    no indication of it, so it is worth surfacing here.
-    """
+    """Warn once if invariant_cgrad is configured so that it can never intervene."""
     global _INVARIANT_GATE_CHECKED
     if _INVARIANT_GATE_CHECKED:
         return
@@ -133,773 +173,573 @@ def _check_invariant_gate_reachable(alpha_d, epsilon, h):
             f"be identical to standard BPTT. Lower snnbp_h or raise "
             f"snnbp_beta/snnbp_epsilon.", RuntimeWarning)
 
+
+def _surrogate_derivative(u, thresh, gama_val, args):
+    mode = _get_arg(args, 'dS_du', 'Gamma')
+    if mode == "sigmoid":
+        alpha = float(_get_arg(args, 'surrogate_alpha', 4.0))
+        sgax = (u - thresh) * alpha
+        sig = torch.sigmoid(sgax)
+        return (1.0 - sig) * sig * alpha
+    if mode in ("Gamma", "gamma"):
+        g = float(_get_arg(args, 'surrogate_gamma', gama_val))
+        return (1.0 / (g * g)) * (g - (u - thresh).abs()).clamp(min=0.0)
+    if mode == "fast_sigmoid":
+        alpha = float(_get_arg(args, 'surrogate_alpha', 4.0))
+        return 1.0 / (alpha * (u - thresh).abs() + 1.0) ** 2
+    if mode == "ste":
+        return torch.where(
+            (u - thresh).abs() < 0.8,
+            torch.ones_like(u),
+            torch.full_like(u, 0.05),
+        )
+    # Default fallback (Gamma)
+    g = float(_get_arg(args, 'surrogate_gamma', gama_val))
+    return (1.0 / (g * g)) * (g - (u - thresh).abs()).clamp(min=0.0)
+
+
+def _compute_standard_du2_du1(u1, spike, thresh, dS_dU1, detach_reset, reset_mode):
+    if reset_mode == 'soft':
+        if detach_reset:
+            return torch.ones_like(u1)
+        return 1.0 - thresh * dS_dU1
+    if detach_reset:
+        return 1.0 - spike
+    return (1.0 - spike) - (u1 * dS_dU1)
+
+
+def _compute_cgrad_margins(u1, thresh, dL_dS, dL_dU2, reset_mode):
+    if reset_mode == 'soft':
+        term_supra = (2.0 * thresh - u1) * dL_dU2 - dL_dS
+    else:
+        term_supra = thresh * dL_dU2 - dL_dS
+    term_sub = dL_dS - u1 * dL_dU2
+    m = torch.where(u1 < thresh, term_sub, term_supra)
+    m_grad = torch.where(u1 < thresh, m, -m)
+    return m, m_grad
+
+
 # --- Custom Autograd Function ---
 class TimeParallel_LIFSpike(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, thresh, decay, input_scale, gama, args, detach_reset, reset_mode):
+    def forward(ctx, x, thresh, decay, input_scale, gama, args, detach_reset, reset_mode, collect_stats=None):
         # SpikingJelly Standard: [Time, Batch, *Spatial]
         T, batch_size, *spatial_dims = x.shape
-        device = x.device
-        
-        # Initialize membrane (Batch, Spatial)
-        mem = torch.zeros(batch_size, *spatial_dims, device=device)
-        
-        # Storage lists
+        work_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+        mem = torch.zeros(batch_size, *spatial_dims, device=x.device, dtype=work_dtype)
+
         mem_before_spikes = []
         spikes = []
-        mems_after_spikes = []
-        
+
         for t in range(T):
-            # Update membrane: mem * decay + input[t] * input_scale
-            # This matches SpikingJelly: v += (x - v) / tau  =>  v = v(1-1/tau) + x(1/tau)
-            mem_before_spike = mem * decay + x[t] * input_scale
-            mem_before_spikes.append(mem_before_spike.clone())
-            
-            # Spike generation
-            spike = (mem_before_spike > thresh).float()
+            mem_before_spike = mem * decay + x[t].to(work_dtype) * input_scale
+            mem_before_spikes.append(mem_before_spike)
+
+            spike = (mem_before_spike > thresh).to(work_dtype)
             spikes.append(spike)
-            
-            # Reset
+
             if reset_mode == 'soft':
                 mem = mem_before_spike - thresh * spike
             else:  # 'hard'
-                mem = mem_before_spike * (1 - spike)
-            # mems_after_spikes.append(mem)
-        
-        # Stack along dimension 0 (Time)
+                mem = mem_before_spike * (1.0 - spike)
+
         mem_before_spikes = torch.stack(mem_before_spikes, dim=0)
-        spikes_tensor = torch.stack(spikes, dim=0)
-        # mems_after_spikes = torch.stack(mems_after_spikes, dim=0)
-        
-        # Save context
-        ctx.save_for_backward(mem_before_spikes, spikes_tensor, x, torch.tensor([gama]))
-        ctx.thresh = thresh
-        ctx.decay = decay
-        ctx.input_scale = input_scale
+        spikes_tensor = torch.stack(spikes, dim=0).to(x.dtype)
+
+        ctx.save_for_backward(mem_before_spikes, spikes_tensor)
+        ctx.thresh = float(thresh)
+        ctx.decay = float(decay)
+        ctx.input_scale = float(input_scale)
+        ctx.gama = float(gama)
         ctx.args = args
-        ctx.detach_reset = detach_reset
+        ctx.detach_reset = bool(detach_reset)
         ctx.reset_mode = reset_mode
-        
+        ctx.collect_stats = collect_stats
+
         return spikes_tensor
 
     @staticmethod
     def backward(ctx, grad_output):
-        mem_before_spikes, spikes_tensor, x, gama = ctx.saved_tensors
+        mem_before_spikes, spikes_tensor = ctx.saved_tensors
         thresh = ctx.thresh
         decay = ctx.decay
         input_scale = ctx.input_scale
+        gama_val = ctx.gama
         args = ctx.args
         detach_reset = ctx.detach_reset
         reset_mode = ctx.reset_mode
-        
-        # Output Gradients
+        collect_stats = ctx.collect_stats
+
+        T = mem_before_spikes.shape[0]
+        work_dtype = torch.float64 if grad_output.dtype == torch.float64 else torch.float32
         grad_x = torch.zeros_like(grad_output)
-        
-        # Gradient accumulator for the next timestep (starts at 0 for last step)
-        grad_memb_last = torch.zeros_like(mem_before_spikes[0]) 
-        
-        # Helper for Surrogate Gradient (dS/dU)
-        def get_dS_dU1(u, thresh, gama, args):
-            mode = getattr(args, 'dS_du', 'Gamma')
-            if mode == "sigmoid":
-                # SpikingJelly default alpha is often 4.0
-                alpha = getattr(args, 'surrogate_alpha', 4.0) 
-                sgax = (u - thresh) * alpha
-                return (1.0 - torch.sigmoid(sgax)) * torch.sigmoid(sgax) * alpha
-                
-            elif mode == "Gamma":
-                # Standard triangular surrogate
-                return (1 / gama.item()**2) * (gama.item() - (u - thresh).abs()).clamp(min=0)
-            
-            # Default fallback
-            return (1 / gama.item()**2) * (gama.item() - (u - thresh).abs()).clamp(min=0)
+        grad_memb_last = torch.zeros(
+            mem_before_spikes.shape[1:], device=grad_output.device, dtype=work_dtype
+        )
 
-        # Backward Time Loop (Iterate T from end to start)
-        for t in reversed(range(x.shape[0])):
-            u1 = mem_before_spikes[t]
-            dL_dS = grad_output[t]        # Gradient from loss w.r.t Spike[t]
-            dL_dU2 = grad_memb_last * decay # Propagate via decay factor
-            
-            dS_dU1 = get_dS_dU1(u1, thresh, gama, args)
-            
-            # --- CUSTOM GRADIENT LOGIC ---
-            mode = getattr(args, 'du_du', 'complex54')
-            
-            if reset_mode == 'soft':
-                if detach_reset:
-                    dU2_dU1_standard = torch.ones_like(u1)
+        mode = _get_arg(args, 'du_du', 'complex54')
+        if collect_stats is True:
+            do_collect = _CGRAD_STATS is not None
+        elif collect_stats is False:
+            do_collect = False
+        else:
+            do_collect = (_CGRAD_STATS is not None and random.random() < _CGRAD_STATS_P)
+
+        for t in reversed(range(T)):
+            u1 = mem_before_spikes[t].to(work_dtype)
+            spike = spikes_tensor[t].to(work_dtype)
+            dL_dS = grad_output[t].to(work_dtype)
+            dL_dU2 = grad_memb_last * decay
+
+            dS_dU1 = _surrogate_derivative(u1, thresh, gama_val, args)
+            dU2_dU1_standard = _compute_standard_du2_du1(
+                u1, spike, thresh, dS_dU1, detach_reset, reset_mode
+            )
+            base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
+
+            if mode == "improved_cgrad":
+                blend_eta = float(_get_arg(args, 'snnbp_eta', 1.0))
+                epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.35))
+                if blend_eta == 0.0:
+                    dL_dU1 = base_function
+                    if do_collect:
+                        delta = u1 - thresh
+                        zeros = torch.zeros_like(base_function)
+                        _accumulate_cgrad_stats(
+                            zeros, zeros, zeros, zeros, delta.abs() <= epsilon, base_function
+                        )
                 else:
-                    # Full gradient: 1 - V_th * dS/dU
-                    dU2_dU1_standard = 1 - thresh * dS_dU1
-            else:  # 'hard'
-                if detach_reset:
-                    # Reset gradient is just (1 - S)
-                    dU2_dU1_standard = (1 - spikes_tensor[t])
-                else:
-                    # Full gradient: (1 - S) - U * dS/dU
-                    dU2_dU1_standard = (1 - spikes_tensor[t]) - (u1 * dS_dU1)
+                    norm_mode = _get_arg(args, 'snnbp_norm', 'local')
+                    harmful_only = bool(_get_arg(args, 'snnbp_harmful_only', True))
+                    alpha_m = float(_get_arg(args, 'snnbp_alpha', 3.0))
+                    beta_d = float(_get_arg(args, 'snnbp_beta', 8.0))
+                    alpha_mis = float(_get_arg(args, 'snnbp_alpha_mis', alpha_m))
+                    margin_m = float(_get_arg(args, 'snnbp_margin_m', 0.0))
+                    h_thresh = float(_get_arg(args, 'snnbp_intervention', 0.0))
+                    gamma_sharp = float(_get_arg(args, 'snnbp_gamma_sharp', 0.0))
+                    corr_scale = float(_get_arg(args, 'snnbp_corr_scale', 0.5))
 
-            if mode == "complex54":
-                epsilon = getattr(args, 'snnbp_epsilon', 0.3468)
-                alpha = getattr(args, 'snnbp_alpha', 1.1742)
-                beta = getattr(args, 'snnbp_beta', 0.9245)
-                p = getattr(args, 'snnbp_p', 9.5334)
+                    delta = u1 - thresh
+                    m, m_grad = _compute_cgrad_margins(u1, thresh, dL_dS, dL_dU2, reset_mode)
 
-                if reset_mode == 'soft':
-                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
-                else:
-                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
-                term_sub_threshold = dL_dS - (u1 * dL_dU2)
-                
-                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
-                m_grad = torch.where(u1 < thresh, m, -m)
+                    if norm_mode == 'none':
+                        m_eff = m
+                        misalignment = -m_grad * base_function
+                    elif norm_mode == 'local':
+                        err_scale = dL_dS.abs() + (thresh * dL_dU2).abs() + 1e-12
+                        m_eff = m / err_scale
+                        misalignment = (-m_grad / err_scale) * (base_function / err_scale)
+                    elif norm_mode == 'rms':
+                        rms_m = torch.sqrt((m * m).mean() + 1e-20)
+                        rms_g = torch.sqrt((base_function * base_function).mean() + 1e-20)
+                        m_eff = m / rms_m
+                        misalignment = (-m_grad / rms_m) * (base_function / rms_g)
+                    else:
+                        raise ValueError(
+                            f"Unsupported snnbp_norm {norm_mode!r}; expected 'local', 'rms', or 'none'."
+                        )
 
-                # Base Function (Standard BPTT)
-                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
+                    m_score = m_eff if harmful_only else m_eff.abs()
+                    g_m = torch.sigmoid(alpha_m * (m_score - margin_m))
+                    g_d = torch.sigmoid(beta_d * (epsilon - delta.abs()))
+                    g_misalign = torch.sigmoid(alpha_mis * misalignment)
 
-                # Gates
+                    intervention_signal = g_m * g_d * g_misalign
+                    if gamma_sharp > 0.0:
+                        do_intervene = (intervention_signal > h_thresh).to(work_dtype)
+                        blend_factor = do_intervene * torch.sigmoid(
+                            gamma_sharp * (intervention_signal - h_thresh)
+                        )
+                    else:
+                        blend_factor = torch.clamp(intervention_signal, 0.0, 1.0)
+
+                    soft_correction = torch.sign(m_grad) * (base_function.abs() * corr_scale)
+                    w = blend_eta * blend_factor
+                    dL_dU1 = (1.0 - w) * base_function + w * soft_correction
+
+                    if do_collect:
+                        _accumulate_cgrad_stats(
+                            w.detach() > 0.01,
+                            w.detach(),
+                            intervention_signal.detach(),
+                            m.detach(),
+                            delta.abs() <= epsilon,
+                            base_function.detach(),
+                        )
+
+                    if METRICS_COLLECTOR is not None:
+                        stats = {
+                            't': t,
+                            'mean_omega': float(intervention_signal.detach().mean().item()),
+                            'active_frac': float((w.detach() > 0.01).to(work_dtype).mean().item()),
+                            'mean_weight': float(w.detach().mean().item()),
+                        }
+                        if callable(METRICS_COLLECTOR):
+                            METRICS_COLLECTOR(stats)
+                        elif hasattr(METRICS_COLLECTOR, 'append'):
+                            METRICS_COLLECTOR.append(stats)
+
+            elif mode == "complex54":
+                epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.3468))
+                alpha = float(_get_arg(args, 'snnbp_alpha', 1.1742))
+                beta = float(_get_arg(args, 'snnbp_beta', 0.9245))
+                p = float(_get_arg(args, 'snnbp_p', 9.5334))
+
+                m, m_grad = _compute_cgrad_margins(u1, thresh, dL_dS, dL_dU2, reset_mode)
                 g_m = torch.sigmoid(alpha * m)
                 delta = u1 - thresh
                 g_d = torch.sigmoid(beta * (epsilon - delta.abs()))
-                
-                # Directionality
-                g_dir = torch.clamp(-1 * torch.sign(m_grad) * torch.sign(base_function), 0, 1)
-                
-                # Fusion
-                f = torch.clamp(p * g_m * g_d * g_dir, 0, 1)
-                
-                # Final Gradient
-                compute_dist = torch.max(delta.abs(), epsilon * torch.ones_like(delta))
-                dL_dU1 = f * (m_grad / (compute_dist)) + (1 - f) * base_function
-            
+                g_dir = torch.clamp(-1.0 * torch.sign(m_grad) * torch.sign(base_function), 0.0, 1.0)
+                f = torch.clamp(p * g_m * g_d * g_dir, 0.0, 1.0)
+                compute_dist = torch.clamp(delta.abs(), min=epsilon)
+                dL_dU1 = f * (m_grad / compute_dist) + (1.0 - f) * base_function
+
             elif mode == "smooth_cgrad":
-                epsilon = getattr(args, 'snnbp_epsilon', 0.3468)
-                alpha = getattr(args, 'snnbp_alpha', 1.1742)
-                beta = getattr(args, 'snnbp_beta', 0.9245)
-                p = getattr(args, 'snnbp_p', 9.5334)
-                k_dir = getattr(args, 'snnbp_k_dir', 1.0)
+                epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.3468))
+                alpha = float(_get_arg(args, 'snnbp_alpha', 1.1742))
+                beta = float(_get_arg(args, 'snnbp_beta', 0.9245))
+                p = float(_get_arg(args, 'snnbp_p', 9.5334))
+                k_dir = float(_get_arg(args, 'snnbp_k_dir', 1.0))
 
-                if reset_mode == 'soft':
-                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
-                else:
-                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
-                term_sub_threshold = dL_dS - (u1 * dL_dU2)
-                
-                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
-                m_grad = torch.where(u1 < thresh, m, -m)
-
-                # Base Function (Standard BPTT)
-                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
-
-                # Gates
+                m, m_grad = _compute_cgrad_margins(u1, thresh, dL_dS, dL_dU2, reset_mode)
                 g_m = torch.sigmoid(alpha * m)
                 delta = u1 - thresh
                 g_d = torch.sigmoid(beta * (epsilon - delta.abs()))
-                
-                # Directionality (Smoothed)
                 g_dir = torch.sigmoid(-k_dir * m_grad * base_function)
-                
-                # Fusion
-                f = torch.clamp(p * g_m * g_d * g_dir, 0, 1)
-                
-                # Final Gradient
-                compute_dist = torch.max(delta.abs(), epsilon * torch.ones_like(delta))
-                dL_dU1 = f * (m_grad / (compute_dist)) + (1 - f) * base_function
+                f = torch.clamp(p * g_m * g_d * g_dir, 0.0, 1.0)
+                compute_dist = torch.clamp(delta.abs(), min=epsilon)
+                dL_dU1 = f * (m_grad / compute_dist) + (1.0 - f) * base_function
 
             elif mode == "stable_cgrad":
-                """
-                Stabilized Custom Gradient
-                --------------------------
-                Key stability improvements:
-                1. Logarithmic scaling instead of division to prevent gradient explosion
-                2. Soft magnitude clamping using tanh
-                3. Smoother blending via softplus gates
-                4. Gradient magnitude bounded relative to base_function
-                """
-                epsilon = getattr(args, 'snnbp_epsilon', 0.3)
-                alpha = getattr(args, 'snnbp_alpha', 1.0)
-                beta = getattr(args, 'snnbp_beta', 1.0)
-                max_ratio = getattr(args, 'snnbp_max_ratio', 3.0)  # Max multiplier vs base gradient
-                
-                delta = u1 - thresh
-                
-                # Compute correction terms
-                if reset_mode == 'soft':
-                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
-                else:
-                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
-                term_sub_threshold = dL_dS - (u1 * dL_dU2)
-                
-                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
-                m_grad = torch.where(u1 < thresh, m, -m)
-                
-                # Base Function (Standard BPTT)
-                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
-                
-                # Stability improvement 1: Use log-based scaling instead of division
-                # log(1 + |delta|/epsilon) provides smooth, bounded scaling
-                log_scale = torch.log1p(delta.abs() / epsilon)
-                scaled_correction = m_grad * torch.tanh(log_scale)  # tanh bounds to [-1, 1]
-                
-                # Stability improvement 2: Soft gates using softplus (smoother than sigmoid)
-                g_m = torch.sigmoid(alpha * m)  # Magnitude gate
-                g_d = torch.sigmoid(beta * (epsilon - delta.abs()))  # Distance gate
-                
-                # Stability improvement 3: Smooth directionality (avoid hard sign)
-                k_smooth = getattr(args, 'snnbp_k_dir', 2.0)
-                alignment = -m_grad * base_function  # Negative when opposing
-                g_dir = torch.sigmoid(k_smooth * alignment / (base_function.abs() + 1e-8))
-                
-                # Combined blend factor (no p multiplier, inherently bounded 0-1)
-                f = g_m * g_d * g_dir
-                
-                # Stability improvement 4: Bound correction magnitude relative to base
-                base_mag = base_function.abs() + 1e-8
-                correction = scaled_correction * base_mag * max_ratio
-                
-                # Final blended gradient
-                dL_dU1 = f * correction + (1 - f) * base_function
+                epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.3))
+                alpha = float(_get_arg(args, 'snnbp_alpha', 1.0))
+                beta = float(_get_arg(args, 'snnbp_beta', 1.0))
+                max_ratio = float(_get_arg(args, 'snnbp_max_ratio', 3.0))
+                k_smooth = float(_get_arg(args, 'snnbp_k_dir', 2.0))
 
-            elif mode == "adaptive_cgrad":
-                """
-                Adaptive Custom Gradient
-                ------------------------
-                Key stability improvements:
-                1. Normalizes correction by local gradient statistics
-                2. Uses running estimates to adapt correction strength
-                3. EMA-style smoothing for magnitude bounds
-                4. Correction strength decays when base gradient is large
-                """
-                epsilon = getattr(args, 'snnbp_epsilon', 0.3)
-                alpha = getattr(args, 'snnbp_alpha', 1.0)
-                beta = getattr(args, 'snnbp_beta', 1.0)
-                decay_rate = getattr(args, 'snnbp_decay', 0.5)
-                
                 delta = u1 - thresh
-                
-                # Compute correction terms
-                if reset_mode == 'soft':
-                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
-                else:
-                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
-                term_sub_threshold = dL_dS - (u1 * dL_dU2)
-                
-                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
-                m_grad = torch.where(u1 < thresh, m, -m)
-                
-                # Base Function (Standard BPTT)
-                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
-                base_mag = base_function.abs() + 1e-8
-                
-                # Adaptive: Use base gradient magnitude to normalize correction
-                # When base gradient is large, we trust it more (less correction)
-                # When base gradient is small, correction has more influence
-                adaptive_scale = 1.0 / (1.0 + decay_rate * base_mag)
-                
-                # Bounded correction: divide by soft distance, clamp magnitude
-                soft_dist = torch.sqrt(delta.abs().pow(2) + epsilon**2)
-                raw_correction = m_grad / soft_dist
-                
-                # Clamp correction to be within reasonable bounds of base gradient
-                max_correction = 2.0 * base_mag
-                clamped_correction = torch.clamp(raw_correction, -max_correction, max_correction)
-                
-                # Gates
+                m, m_grad = _compute_cgrad_margins(u1, thresh, dL_dS, dL_dU2, reset_mode)
+                log_scale = torch.log1p(delta.abs() / epsilon)
+                scaled_correction = m_grad * torch.tanh(log_scale)
                 g_m = torch.sigmoid(alpha * m)
                 g_d = torch.sigmoid(beta * (epsilon - delta.abs()))
-                
-                # Smooth directionality  
-                k_dir = getattr(args, 'snnbp_k_dir', 1.0)
-                g_dir = torch.sigmoid(-k_dir * m_grad * base_function / (base_mag**2 + 1e-6))
-                
-                # Blend factor with adaptive scaling
-                f = torch.clamp(g_m * g_d * g_dir * adaptive_scale, 0, 1)
-                
-                # Final gradient
-                dL_dU1 = f * clamped_correction + (1 - f) * base_function
+                alignment = -m_grad * base_function
+                g_dir = torch.sigmoid(k_smooth * alignment / (base_function.abs() + 1e-8))
+                f = g_m * g_d * g_dir
+                base_mag = base_function.abs() + 1e-8
+                correction = scaled_correction * base_mag * max_ratio
+                dL_dU1 = f * correction + (1.0 - f) * base_function
+
+            elif mode == "adaptive_cgrad":
+                epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.3))
+                alpha = float(_get_arg(args, 'snnbp_alpha', 1.0))
+                beta = float(_get_arg(args, 'snnbp_beta', 1.0))
+                decay_rate = float(_get_arg(args, 'snnbp_decay', 0.5))
+                k_dir = float(_get_arg(args, 'snnbp_k_dir', 1.0))
+
+                delta = u1 - thresh
+                m, m_grad = _compute_cgrad_margins(u1, thresh, dL_dS, dL_dU2, reset_mode)
+                base_mag = base_function.abs() + 1e-8
+                adaptive_scale = 1.0 / (1.0 + decay_rate * base_mag)
+                soft_dist = torch.sqrt(delta.abs().pow(2) + epsilon ** 2)
+                raw_correction = m_grad / soft_dist
+                max_correction = 2.0 * base_mag
+                clamped_correction = torch.clamp(raw_correction, -max_correction, max_correction)
+                g_m = torch.sigmoid(alpha * m)
+                g_d = torch.sigmoid(beta * (epsilon - delta.abs()))
+                g_dir = torch.sigmoid(-k_dir * m_grad * base_function / (base_mag ** 2 + 1e-6))
+                f = torch.clamp(g_m * g_d * g_dir * adaptive_scale, 0.0, 1.0)
+                dL_dU1 = f * clamped_correction + (1.0 - f) * base_function
 
             elif mode == "conservative_cgrad":
-                """
-                Conservative Custom Gradient
-                ----------------------------
-                Key stability improvements:
-                1. Only intervenes in high-confidence problematic cases
-                2. Uses higher thresholds for activation
-                3. Interpolates toward base gradient rather than custom correction
-                4. Minimal disruption to standard training dynamics
-                """
-                epsilon = getattr(args, 'snnbp_epsilon', 0.3)
-                alpha = getattr(args, 'snnbp_alpha', 2.0)  # Higher = more selective
-                beta = getattr(args, 'snnbp_beta', 2.0)
-                intervention_threshold = getattr(args, 'snnbp_intervention', 0.8)
-                eta = getattr(args, 'snnbp_eta', 0.5)        # Correction magnitude constant
-                p = getattr(args, 'snnbp_p', 0.5)
-                blend_scale = getattr(args, 'snnbp_blend', 0.5)  # Blend scale factor
-                
+                epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.3))
+                alpha = float(_get_arg(args, 'snnbp_alpha', 2.0))
+                beta = float(_get_arg(args, 'snnbp_beta', 2.0))
+                intervention_threshold = float(_get_arg(args, 'snnbp_intervention', 0.8))
+
                 delta = u1 - thresh
-                
-                # Compute correction terms
-                if reset_mode == 'soft':
-                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
-                else:
-                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
-                term_sub_threshold = dL_dS - (u1 * dL_dU2)
-                
-                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
-                m_grad = torch.where(u1 < thresh, m, -m)
-                
-                # Base Function (Standard BPTT)
-                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
-                
-                # Conservative approach: only care about clear misalignment
-                # Detect when base gradient would push toward undesirable threshold crossing
-                misalignment = -m_grad * base_function  # Positive when base opposes desired direction
-                
-                # High-threshold gates (only activate in clear cases)
-                g_m = torch.sigmoid(alpha * (m.abs() - 0.1))  # Only for significant m
-                g_d = torch.sigmoid(beta * (epsilon - delta.abs()))  # Near threshold
-                g_misalign = torch.sigmoid(alpha * misalignment)  # Clear misalignment
-                
-                # Combined intervention signal
+                m, m_grad = _compute_cgrad_margins(u1, thresh, dL_dS, dL_dU2, reset_mode)
+                misalignment = -m_grad * base_function
+                g_m = torch.sigmoid(alpha * (m.abs() - 0.1))
+                g_d = torch.sigmoid(beta * (epsilon - delta.abs()))
+                g_misalign = torch.sigmoid(alpha * misalignment)
                 intervention_signal = g_m * g_d * g_misalign
-                
-                # Only intervene past threshold
-                do_intervene = (intervention_signal > intervention_threshold).float()
-                
-                # Soft intervention: interpolate toward corrected direction
-                # Instead of replacing gradient, dampen the problematic component
-                correction_direction = torch.sign(m_grad)
-                correction_magnitude = base_function.abs() * 0.5  # Match base scale
-                soft_correction = correction_direction * correction_magnitude
-                
-                # Smooth blending (gradual damping, not hard switch)
-                blend_factor = do_intervene * torch.sigmoid(5 * (intervention_signal - intervention_threshold))
-                
-                # Final gradient: mostly base, with soft correction in extreme cases
-                dL_dU1 = (1 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
+                do_intervene = (intervention_signal > intervention_threshold).to(work_dtype)
+                soft_correction = torch.sign(m_grad) * (base_function.abs() * 0.5)
+                blend_factor = do_intervene * torch.sigmoid(5.0 * (intervention_signal - intervention_threshold))
+                dL_dU1 = (1.0 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
 
             elif mode == "conservative_cgrad_2":
-                """
-                Conservative Custom Gradient
-                ----------------------------
-                Key stability improvements:
-                1. Only intervenes in high-confidence problematic cases
-                2. Uses higher thresholds for activation
-                3. Interpolates toward base gradient rather than custom correction
-                4. Minimal disruption to standard training dynamics
-                """
-                epsilon = getattr(args, 'snnbp_epsilon', 0.3)
-                alpha = getattr(args, 'snnbp_alpha', 2.0)  # Higher = more selective
-                beta = getattr(args, 'snnbp_beta', 2.0)
-                intervention_threshold = getattr(args, 'snnbp_intervention', 0.8)
-                eta = getattr(args, 'snnbp_eta', 0.5)        # Correction magnitude constant
-                p = getattr(args, 'snnbp_p', 0.5)
-                
+                epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.3))
+                alpha = float(_get_arg(args, 'snnbp_alpha', 2.0))
+                beta = float(_get_arg(args, 'snnbp_beta', 2.0))
+                intervention_threshold = float(_get_arg(args, 'snnbp_intervention', 0.8))
+                eta = float(_get_arg(args, 'snnbp_eta', 0.5))
+                p = float(_get_arg(args, 'snnbp_p', 0.5))
+
                 delta = u1 - thresh
-                
-                # Compute correction terms
-                if reset_mode == 'soft':
-                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
-                else:
-                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
-                term_sub_threshold = dL_dS - (u1 * dL_dU2)
-                
-                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
-                m_grad = torch.where(u1 < thresh, m, -m)
-                
-                # Base Function (Standard BPTT)
-                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
-                
-                # Conservative approach: only care about clear misalignment
-                # Detect when base gradient would push toward undesirable threshold crossing
-                misalignment = -m_grad * base_function  # Positive when base opposes desired direction
-                
-                # High-threshold gates (only activate in clear cases)
-                g_m = torch.sigmoid(alpha * (m.abs() - 0.1))  # Only for significant m
-                g_d = torch.sigmoid(beta * (epsilon - delta.abs()))  # Near threshold
-                g_misalign = torch.sigmoid(p * misalignment)  # Clear misalignment
-                
-                # Combined intervention signal
+                m, m_grad = _compute_cgrad_margins(u1, thresh, dL_dS, dL_dU2, reset_mode)
+                misalignment = -m_grad * base_function
+                g_m = torch.sigmoid(alpha * (m.abs() - 0.1))
+                g_d = torch.sigmoid(beta * (epsilon - delta.abs()))
+                g_misalign = torch.sigmoid(p * misalignment)
                 intervention_signal = g_m * g_d * g_misalign
-                
-                # Only intervene past threshold
-                do_intervene = (intervention_signal > intervention_threshold).float()
-                
-                # Soft intervention: interpolate toward corrected direction
-                # Instead of replacing gradient, dampen the problematic component
-                correction_direction = torch.sign(m_grad)
-                correction_magnitude = base_function.abs() * eta  # Match base scale
-                soft_correction = correction_direction * correction_magnitude
-                
-                # Smooth blending (gradual damping, not hard switch)
-                blend_factor = do_intervene * torch.sigmoid(5 * (intervention_signal - intervention_threshold))
-                
-                dL_dU1 = (1 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
+                do_intervene = (intervention_signal > intervention_threshold).to(work_dtype)
+                soft_correction = torch.sign(m_grad) * (base_function.abs() * eta)
+                blend_factor = do_intervene * torch.sigmoid(5.0 * (intervention_signal - intervention_threshold))
+                dL_dU1 = (1.0 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
 
             elif mode == "conservative_ablate":
-                """
-                Conservative Custom Gradient — Ablation Variant
-                ------------------------------------------------
-                Identical to conservative_cgrad but reads ablation toggles
-                from args to selectively disable individual gates:
-                  - ablation_gm:           enable/disable g_m (magnitude gate)
-                  - ablation_gd:           enable/disable g_d (proximity gate)
-                  - ablation_gmisalign:    enable/disable g_misalign (alignment gate)
-                  - ablation_intervention: enable/disable hard intervention threshold
-                When a gate is OFF it is replaced with 1.0 (always-on),
-                removing its filtering effect.
-                """
-                epsilon = getattr(args, 'snnbp_epsilon', 0.3)
-                alpha = getattr(args, 'snnbp_alpha', 2.0)
-                beta = getattr(args, 'snnbp_beta', 2.0)
-                intervention_threshold = getattr(args, 'snnbp_intervention', 0.8)
+                epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.3))
+                alpha = float(_get_arg(args, 'snnbp_alpha', 2.0))
+                beta = float(_get_arg(args, 'snnbp_beta', 2.0))
+                intervention_threshold = float(_get_arg(args, 'snnbp_intervention', 0.8))
 
-                # Ablation toggles (default True = enabled = full method)
-                use_gm = getattr(args, 'ablation_gm', True)
-                use_gd = getattr(args, 'ablation_gd', True)
-                use_gmisalign = getattr(args, 'ablation_gmisalign', True)
-                use_intervention = getattr(args, 'ablation_intervention', True)
+                use_gm = bool(_get_arg(args, 'ablation_gm', True))
+                use_gd = bool(_get_arg(args, 'ablation_gd', True))
+                use_gmisalign = bool(_get_arg(args, 'ablation_gmisalign', True))
+                use_intervention = bool(_get_arg(args, 'ablation_intervention', True))
 
                 delta = u1 - thresh
-
-                # Compute correction terms
-                if reset_mode == 'soft':
-                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
-                else:
-                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
-                term_sub_threshold = dL_dS - (u1 * dL_dU2)
-
-                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
-                m_grad = torch.where(u1 < thresh, m, -m)
-
-                # Base Function (Standard BPTT)
-                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
-
-                # Conservative approach: only care about clear misalignment
+                m, m_grad = _compute_cgrad_margins(u1, thresh, dL_dS, dL_dU2, reset_mode)
                 misalignment = -m_grad * base_function
-
-                # Gates (conditionally ablated)
                 g_m = torch.sigmoid(alpha * (m.abs() - 0.1)) if use_gm else torch.ones_like(m)
                 g_d = torch.sigmoid(beta * (epsilon - delta.abs())) if use_gd else torch.ones_like(delta)
                 g_misalign = torch.sigmoid(alpha * misalignment) if use_gmisalign else torch.ones_like(misalignment)
-
-                # Combined intervention signal
                 intervention_signal = g_m * g_d * g_misalign
-
-                # Only intervene past threshold (or always intervene if ablated)
-                if use_intervention:
-                    do_intervene = (intervention_signal > intervention_threshold).float()
-                else:
-                    do_intervene = torch.ones_like(intervention_signal)
-
-                # Soft intervention: interpolate toward corrected direction
-                correction_direction = torch.sign(m_grad)
-                correction_magnitude = base_function.abs() * 0.5
-                soft_correction = correction_direction * correction_magnitude
-
-                # Smooth blending
-                blend_factor = do_intervene * torch.sigmoid(5 * (intervention_signal - intervention_threshold))
-
-                # Final gradient
-                dL_dU1 = (1 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
+                do_intervene = (
+                    (intervention_signal > intervention_threshold).to(work_dtype)
+                    if use_intervention
+                    else torch.ones_like(intervention_signal)
+                )
+                soft_correction = torch.sign(m_grad) * (base_function.abs() * 0.5)
+                blend_factor = do_intervene * torch.sigmoid(5.0 * (intervention_signal - intervention_threshold))
+                dL_dU1 = (1.0 - 0.5 * blend_factor) * base_function + 0.5 * blend_factor * soft_correction
 
             elif mode == "invariant_cgrad":
-                """
-                Scale-Invariant C-Grad
-                ----------------------
-                Same three-gate structure as conservative_cgrad, but the gates are
-                dimensionless, so the rule is equivariant under rescaling of the loss:
-                replacing L by c*L leaves the produced gradient direction unchanged and
-                scales its magnitude by exactly c.
-
-                Motivation. dL_dS and dL_dU2 -- and therefore m[t] and base_function --
-                carry units of loss, and loss has no canonical scale. It is set by the
-                AMP GradScaler (65536 by default, and halved/doubled dynamically during
-                training), by the batch size under mean reduction, by the TET lambda, and
-                by depth: the first patch-embed layer and the last transformer block see
-                gradients orders of magnitude apart inside a single backward pass.
-                conservative_cgrad compares |m| against the constant 0.1 and feeds
-                m*base_function (quadratic in the loss scale) into a sigmoid, so its gates
-                open and close for reasons unrelated to the neuron. Consistency itself is
-                a sign test and is scale-free; this mode makes the gates scale-free too.
-
-                Construction. Following Sec. 4 of the paper, write the two competing
-                estimates of the loss change induced by a minimal threshold crossing:
-
-                    dL_pred = rho[t] * base_function      (Eq. 6, surrogate-predicted)
-                    dL_jump = m[t]                        (Eq. 7/13, jump-induced)
-
-                Both carry units of loss, so their ratio is dimensionless and their
-                product normalised by a common loss-scale statistic is too. The update is
-                inconsistent (Eq. 10) exactly when dL_pred * dL_jump < 0. Normalising both
-                by the RMS loss-scale of the current tensor removes the scale and, because
-                the statistic is computed per layer and per timestep, also equalises the
-                gate across depth.
-
-                Hyperparameters. alpha_m, alpha_d, h and eta keep their conservative_cgrad
-                meanings; kappa is the harmfulness margin (now relative to the typical
-                harmfulness in this layer rather than an absolute loss), and alpha_c
-                replaces the reuse of alpha_m for the consistency gate. eta is applied
-                here, unlike in conservative_cgrad where it is read but never used.
-                snnbp_blend is deliberately not read: Table 3 lists b as a hyperparameter,
-                but in Algorithm 1 b is the computed smooth factor sigma(gamma*(w-h)) and
-                a separate constant multiplier would be redundant with eta.
-                """
-                epsilon = getattr(args, 'snnbp_epsilon', 0.3)
-                alpha = getattr(args, 'snnbp_alpha', 2.0)          # alpha_m, harmfulness
-                beta = getattr(args, 'snnbp_beta', 2.0)            # alpha_d, proximity
-                alpha_c = getattr(args, 'snnbp_alpha_cons', 2.0)   # consistency gate
-                kappa = getattr(args, 'snnbp_kappa', 1.0)          # relative margin on |m|
-                # Deliberately NOT snnbp_intervention: that parameter defaults to 0.8 for
-                # conservative_cgrad, and 0.8 drives this mode to a 0.00% intervention
-                # rate. Sharing it would silently turn the method into a no-op.
-                intervention_threshold = getattr(args, 'snnbp_h', 0.5)
-                eta = getattr(args, 'snnbp_eta', 0.5)              # correction strength
-                gamma = getattr(args, 'snnbp_gamma', 5.0)          # blend sharpness
-                two_sided = getattr(args, 'snnbp_two_sided', True)
+                epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.3))
+                alpha = float(_get_arg(args, 'snnbp_alpha', 2.0))
+                beta = float(_get_arg(args, 'snnbp_beta', 2.0))
+                alpha_c = float(_get_arg(args, 'snnbp_alpha_cons', 2.0))
+                kappa = float(_get_arg(args, 'snnbp_kappa', 1.0))
+                intervention_threshold = float(_get_arg(args, 'snnbp_h', 0.5))
+                eta = float(_get_arg(args, 'snnbp_eta', 0.5))
+                gamma = float(_get_arg(args, 'snnbp_gamma', 5.0))
+                two_sided = bool(_get_arg(args, 'snnbp_two_sided', True))
                 _check_invariant_gate_reachable(beta, epsilon, intervention_threshold)
 
                 delta = u1 - thresh
                 rho = thresh - u1
+                m, m_grad = _compute_cgrad_margins(u1, thresh, dL_dS, dL_dU2, reset_mode)
 
-                # Jump-induced loss change m[t] (Eq. 13 hard reset / Eq. 22 soft reset)
-                if reset_mode == 'soft':
-                    term_supra_threshold = (2 * thresh - u1) * dL_dU2 - dL_dS
-                else:
-                    term_supra_threshold = (thresh * dL_dU2) - dL_dS
-                term_sub_threshold = dL_dS - (u1 * dL_dU2)
-
-                m = torch.where(u1 < thresh, term_sub_threshold, term_supra_threshold)
-                m_grad = torch.where(u1 < thresh, m, -m)
-
-                # Base Function (Standard BPTT)
-                base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
-
-                # Surrogate-predicted loss change under the minimal crossing (Eq. 6).
-                #
-                # 'product' is Eq. 6 verbatim and the default. It has a structural
-                # defect: dL_pred = rho*g_base is O(rho) while m is O(1) -- the reset
-                # jump does not shrink as u1 approaches V_th -- so the consistency gate
-                # sigmoid(alpha_c * (-m_hat*pred_hat)) has an argument that vanishes
-                # exactly where g_d = sigmoid(beta*(eps-|delta|)) is maximal. The two
-                # gates are mathematically opposed: g_d wants delta -> 0, which forces
-                # rho -> 0, which pins g_cons at sigmoid(0) = 0.5, i.e. no information.
-                # Measured on the synthetic harness, |−m_hat*pred_hat| < 0.05 for 58.7%
-                # of entries, and the resulting gate is ANTI-selective -- 14.6-21.5% of
-                # fired entries are genuinely inconsistent against a 27.5% base rate.
-                #
-                # Note Eq. 10 itself is a *sign* test, which is scale-free and perfectly
-                # well defined as rho -> 0. The defect is introduced by smoothing it with
-                # a sigmoid of the product, which reintroduces the magnitude dependence
-                # the sign test did not have.
-                #
-                #   'ref'  -- keep sign(rho), replace its magnitude with a fixed
-                #             reference distance. sign(pred) is unchanged, so Eq. 10 is
-                #             preserved exactly, but |pred| = thresh*|g_base| no longer
-                #             vanishes at the threshold. Proximity is already measured by
-                #             g_d; carrying it a second time inside g_cons double-counts
-                #             it with opposite sign, which is the conflict above.
-                #   'sign' -- the literal reading of Eq. 10: g_cons depends only on
-                #             sign(m)*sign(pred). Maximally scale-free, but discards
-                #             gradation (a marginal violation counts like a severe one).
-                consistency = getattr(args, 'snnbp_consistency', 'product')
+                consistency = _get_arg(args, 'snnbp_consistency', 'product')
                 if consistency == 'product':
                     dL_pred = rho * base_function
                 else:
-                    dL_pred = torch.where(u1 < thresh, base_function,
-                                          -base_function) * thresh
+                    dL_pred = torch.where(u1 < thresh, base_function, -base_function) * thresh
 
-                # Common loss-scale statistic for this layer at this timestep. Both terms
-                # carry units of loss, so norm scales linearly with the loss scale and
-                # dividing by it cancels the scale exactly. Reduced over every element
-                # (batch and features) of the current tensor, which also equalises the
-                # gate across depth.
-                #
-                # Computed in fp32 regardless of the incoming dtype: under AMP the loss
-                # scale pushes |m| into the thousands, and m**2 would overflow fp16 to inf.
-                # The normalised quantities are O(1), so casting them back is always safe.
                 m32 = m.float()
                 pred32 = dL_pred.float()
                 norm = torch.sqrt(m32.pow(2).mean() + pred32.pow(2).mean()).clamp(min=1e-30)
-                m_hat = (m32 / norm).to(m.dtype)
-                pred_hat = (pred32 / norm).to(m.dtype)
+                m_hat = (m32 / norm).to(work_dtype)
+                pred_hat = (pred32 / norm).to(work_dtype)
 
-                # Gate 1: harmfulness, now relative to the typical harmfulness in this
-                # layer. kappa is dimensionless, unlike the hardcoded 0.1 it replaces.
                 if two_sided:
                     g_m = torch.sigmoid(alpha * (m_hat.abs() - kappa))
                 else:
-                    # Paper Sec. 6.1 as literally written: act only on harmful crossings.
                     g_m = torch.sigmoid(alpha * (m_hat - kappa))
-
-                # Gate 2: nearness to threshold. Unchanged -- delta is a membrane
-                # potential measured in units of V_th, which is a genuine physical scale.
                 g_d = torch.sigmoid(beta * (epsilon - delta.abs()))
-
-                # Gate 3: consistency (Eq. 10). The product is negative exactly when the
-                # surrogate-predicted and jump-induced loss changes disagree in sign, so
-                # this gate opens precisely on inconsistent updates.
                 if consistency == 'sign':
-                    # sign(m_hat)*sign(pred_hat) rather than a division by the
-                    # magnitudes: identical result, no underflow risk in fp16.
-                    g_cons = torch.sigmoid(
-                        alpha_c * (-torch.sign(m_hat) * torch.sign(pred_hat)))
+                    g_cons = torch.sigmoid(alpha_c * (-torch.sign(m_hat) * torch.sign(pred_hat)))
                 else:
                     g_cons = torch.sigmoid(alpha_c * (-m_hat * pred_hat))
 
-                # Combined intervention signal, as the geometric mean of the three gates
-                # rather than their raw product.
-                #
-                # A product of three sigmoids is badly miscalibrated as a soft AND: each
-                # factor is bounded well below 1 (g_d in particular can never exceed
-                # sigmoid(alpha_d*epsilon), which is 0.62 at the paper's defaults), so the
-                # product has a ceiling near 0.3 and any h above that makes the rule dead
-                # -- silently, with no error and no gradient change. That is exactly the
-                # failure conservative_cgrad exhibits: with the benchmark defaults
-                # (alpha_d=2.0, epsilon=0.3, h=0.8) its ceiling is 0.646 < h and it can
-                # never fire at all. The geometric mean keeps the same "all three gates
-                # must agree" semantics while staying in [0,1] and remaining reachable,
-                # so h reads as "the typical gate value required to intervene".
                 intervention_signal = (g_m * g_d * g_cons).pow(1.0 / 3.0)
+                do_intervene = (intervention_signal > intervention_threshold).to(work_dtype)
 
-                # Only intervene past threshold
-                do_intervene = (intervention_signal > intervention_threshold).float()
-
-                # random.random() rather than torch.rand(): a host-side draw costs
-                # nothing, whereas sampling on device would force a sync.
-                if _CGRAD_STATS is not None and random.random() < _CGRAD_STATS_P:
-                    _accumulate_cgrad_stats(do_intervene, intervention_signal, m,
-                                            delta.abs() <= epsilon)
-
-                # Corrective direction (Algorithm 1 line 11): sign(m*rho) repels u1 from
-                # the threshold when m > 0 and attracts it when m < 0. Magnitude is tied
-                # to |base_function| so the correction is equivariant by construction.
                 soft_correction = torch.sign(m_grad) * base_function.abs()
-
-                # Smooth blending (Algorithm 1 lines 6-9), then the eta-weighted
-                # interpolation of line 12: g_cgrad = (1 - eta*b)*g_base + eta*b*g_corr
                 blend_factor = do_intervene * torch.sigmoid(
-                    gamma * (intervention_signal - intervention_threshold))
+                    gamma * (intervention_signal - intervention_threshold)
+                )
                 w = eta * blend_factor
 
-                # Mechanism ablation. 'blend' is Algorithm 1 and the default; the other
-                # two isolate *what* the intervention does from *when* it fires, which
-                # the blend confounds.
-                #
-                # Note the algebra of 'blend': on an inconsistent entry
-                # soft_correction = -base_function, so the update is (1-2w)*base_function
-                # with w = eta*blend_factor.
-                #
-                # blend_factor is bounded in (0.5, 1], but its *realized* value is much
-                # tighter than that bound, because the gate fires only where sig exceeds
-                # h, so sig-h is small by construction and sigmoid(gamma*(sig-h)) stays
-                # near 0.5. Measured over the 26 sweep configs with intervention rate
-                # above 10%, blend_factor has median 0.53-0.61 and p95 never above 0.76 --
-                # it never approaches 1. So in practice w ~ 0.57*eta and the multiplier is
-                # ~ 1 - 1.14*eta, crossing zero near eta = 0.88 rather than at 0.5.
-                #
-                # Consequently the published default eta=0.5 shrinks an inconsistent
-                # gradient by roughly 57% and never deletes or reverses it; the fraction
-                # of inconsistent entries that actually flip sign is 0% for eta <~ 0.70,
-                # ~14% at 0.76, ~50% at 0.88 and ~95% at 0.98. Reasoning from the (0.5, 1]
-                # bound alone puts the damper/redirector boundary at eta=0.5, which is
-                # wrong by a wide margin.
-                #
-                #   'mask' -- discard the entry entirely: use no information rather than
-                #             possibly-wrong information. eta and gamma are inert.
-                #   'flip' -- commit fully to the corrective direction. eta and gamma
-                #             are inert. This is the eta=1, hard-gate limit.
-                correction = getattr(args, 'snnbp_correction', 'blend')
+                correction = _get_arg(args, 'snnbp_correction', 'blend')
                 if correction == 'mask':
-                    dL_dU1 = (1 - do_intervene) * base_function
+                    dL_dU1 = (1.0 - do_intervene) * base_function
+                    eff_w = do_intervene
                 elif correction == 'flip':
-                    dL_dU1 = torch.where(do_intervene.bool(),
-                                         soft_correction, base_function)
+                    dL_dU1 = torch.where(do_intervene.bool(), soft_correction, base_function)
+                    eff_w = do_intervene
                 else:
-                    dL_dU1 = (1 - w) * base_function + w * soft_correction
+                    dL_dU1 = (1.0 - w) * base_function + w * soft_correction
+                    eff_w = w
+
+                if do_collect:
+                    _accumulate_cgrad_stats(
+                        do_intervene.detach(),
+                        eff_w.detach(),
+                        intervention_signal.detach(),
+                        m.detach(),
+                        delta.abs() <= epsilon,
+                        base_function.detach(),
+                    )
 
             elif mode == "":
-                print("not ready")
-                exit()
+                raise ValueError("Empty du_du mode is invalid")
 
-                
             elif mode == "TET":
-                dL_dU1 = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
+                dL_dU1 = base_function
             else:
                 # Default LIF
-                dL_dU1 = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
+                dL_dU1 = base_function
 
-            # Update for next iteration
             grad_memb_last = dL_dU1
-            
-            # Gradient w.r.t Input X[t]
-            # Since mem[t] = mem[t-1]*decay + x[t]*input_scale
-            # dL/dx[t] = dL/dMem[t] * input_scale
-            grad_x[t] = grad_memb_last * input_scale
+            grad_x[t] = (grad_memb_last * input_scale).to(grad_output.dtype)
 
-        return grad_x, None, None, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None, None, None
+
 
 ## --- Native Drop-in Replacement ---
 class LIFSpikeLayer_Cons(nn.Module):
-    def __init__(self, thresh=1.0, tau=2.0, gama=1.0, detach_reset=True, args=None, **kwargs):
+    def __init__(
+        self,
+        thresh=1.0,
+        tau=2.0,
+        gama=1.0,
+        detach_reset=True,
+        input_scale='coupled',
+        reset_mode='hard',
+        args=None,
+        **kwargs,
+    ):
         super(LIFSpikeLayer_Cons, self).__init__()
-        self.thresh = thresh
-        self.detach_reset = detach_reset # <--- Capture this arg
-        
-        self.args = args if args is not None else GLOBAL_ARGS
-        self.reset_mode = getattr(self.args, 'reset_mode', 'hard') if self.args else 'hard'
-        
-        if self.args and hasattr(self.args, 'snnbp_tau') and self.args.snnbp_tau is not None:
-            self.decay = self.args.snnbp_tau
-            self.input_scale = 1.0 - self.decay
-        else:
-            self.decay = 1.0 - (1.0 / tau)
-            self.input_scale = 1.0 / tau
-            
-        self.gama = gama
+        if 'v_threshold' in kwargs:
+            thresh = kwargs['v_threshold']
+        self.thresh = float(thresh)
+        self.tau = float(tau)
+        self.gama = float(gama)
+        self.detach_reset = bool(detach_reset)
+        self.raw_input_scale = input_scale
+        self.reset_mode = reset_mode
+        self._explicit_args = args
+
+        active_args = self._explicit_args if self._explicit_args is not None else GLOBAL_ARGS
+        if active_args is not None and getattr(active_args, 'reset_mode', None) is not None:
+            self.reset_mode = active_args.reset_mode
+        if active_args is not None and getattr(active_args, 'detach_reset', None) is not None:
+            self.detach_reset = bool(active_args.detach_reset)
+        self.decay, self.input_scale = _resolve_tau_and_scale(self.tau, self.raw_input_scale, active_args)
+
+    @property
+    def args(self):
+        return self._explicit_args if self._explicit_args is not None else GLOBAL_ARGS
 
     def forward(self, x):
-        use_triton = TRITON_AVAILABLE and x.is_cuda and (os.environ.get('DISABLE_TRITON', '0') != '1')
+        active_args = self.args
+        decay, input_scale = _resolve_tau_and_scale(self.tau, self.raw_input_scale, active_args)
+        reset_mode = (
+            active_args.reset_mode
+            if (active_args is not None and getattr(active_args, 'reset_mode', None) is not None)
+            else self.reset_mode
+        )
+        detach_reset = (
+            bool(active_args.detach_reset)
+            if (active_args is not None and getattr(active_args, 'detach_reset', None) is not None)
+            else self.detach_reset
+        )
+
+        # Keep cached attributes synchronized with active args
+        self.decay = decay
+        self.input_scale = input_scale
+
+        mode = _get_arg(active_args, 'du_du', 'complex54')
+        norm_mode = _get_arg(active_args, 'snnbp_norm', 'local')
+
+        collect_stats = (
+            _CGRAD_STATS is not None
+            and self.training
+            and mode in ('improved_cgrad', 'invariant_cgrad')
+            and random.random() < _CGRAD_STATS_P
+        )
+
+        triton_supported_mode = mode in (
+            'LIF',
+            'TET',
+            'conservative_cgrad',
+            'invariant_cgrad',
+            'improved_cgrad',
+        )
+        triton_supported_norm = not (mode == 'improved_cgrad' and norm_mode == 'rms')
+        use_triton = (
+            TRITON_AVAILABLE
+            and x.is_cuda
+            and x.dtype in (torch.float32, torch.float16, torch.bfloat16)
+            and (os.environ.get('DISABLE_TRITON', '0') != '1')
+            and triton_supported_mode
+            and triton_supported_norm
+            and not collect_stats
+        )
         if use_triton:
-            return TritonTimeParallel_LIFSpike.apply(x, self.thresh, self.decay, self.input_scale, self.gama, self.args, self.detach_reset, self.reset_mode)
-        return TimeParallel_LIFSpike.apply(x, self.thresh, self.decay, self.input_scale, self.gama, self.args, self.detach_reset, self.reset_mode)
-        
+            return TritonTimeParallel_LIFSpike.apply(
+                x, self.thresh, decay, input_scale, self.gama, active_args, detach_reset, reset_mode
+            )
+        return TimeParallel_LIFSpike.apply(
+            x, self.thresh, decay, input_scale, self.gama, active_args, detach_reset, reset_mode, collect_stats
+        )
+
+
 class MultiStepLIFNode(nn.Module):
-    def __init__(self, thresh=1.0, tau=2.0, gama=1.0, detach_reset=True, args=None, **kwargs):
+    def __init__(
+        self,
+        thresh=1.0,
+        tau=2.0,
+        gama=1.0,
+        detach_reset=True,
+        input_scale='coupled',
+        reset_mode='hard',
+        args=None,
+        **kwargs,
+    ):
         super(MultiStepLIFNode, self).__init__()
-        
+
+        active_args = args if args is not None else GLOBAL_ARGS
         use_custom = True
-        if GLOBAL_ARGS is not None and hasattr(GLOBAL_ARGS, 'use_custom_neuron'):
-             use_custom = GLOBAL_ARGS.use_custom_neuron
-        
-        # Override detach_reset if set globally
+        if active_args is not None and getattr(active_args, 'use_custom_neuron', None) is not None:
+            use_custom = active_args.use_custom_neuron
+
         real_detach_reset = detach_reset
-        if GLOBAL_ARGS is not None and hasattr(GLOBAL_ARGS, 'detach_reset') and GLOBAL_ARGS.detach_reset is not None:
-            real_detach_reset = GLOBAL_ARGS.detach_reset
-        
-        # Check for v_threshold in kwargs (aliasing thresh)
+        if active_args is not None and getattr(active_args, 'detach_reset', None) is not None:
+            real_detach_reset = bool(active_args.detach_reset)
+
         real_thresh = thresh
         if 'v_threshold' in kwargs:
             real_thresh = kwargs['v_threshold']
-        
-        self.impl = None
+
         if use_custom:
-            self.impl = LIFSpikeLayer_Cons(thresh=real_thresh, tau=tau, gama=gama, detach_reset=real_detach_reset, args=args, **kwargs)
+            self.impl = LIFSpikeLayer_Cons(
+                thresh=real_thresh,
+                tau=tau,
+                gama=gama,
+                detach_reset=real_detach_reset,
+                input_scale=input_scale,
+                reset_mode=reset_mode,
+                args=args,
+                **kwargs,
+            )
         else:
+            if OriginalLIFNode is None:
+                raise ImportError("spikingjelly is required when use_custom_neuron=False.")
             oj_kwargs = kwargs.copy()
-            # Ensure v_threshold is set for Original
             if 'v_threshold' not in oj_kwargs:
                 oj_kwargs['v_threshold'] = real_thresh
-            
-            # Handle potential mismatching args if necessary (e.g. backend)
-            # SpikingJelly usually behaves well with extra kwargs or has backend.
-            
+            if DISABLE_CUPY or (active_args is not None and getattr(active_args, 'disable_cupy', False)):
+                oj_kwargs['backend'] = 'torch'
             self.impl = OriginalLIFNode(
-                tau=tau, 
-                detach_reset=real_detach_reset, 
-                **oj_kwargs
+                tau=tau,
+                detach_reset=real_detach_reset,
+                **oj_kwargs,
             )
-            
+
     def forward(self, x):
         return self.impl(x)
 

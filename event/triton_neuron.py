@@ -4,6 +4,31 @@ import triton
 import triton.language as tl
 import math
 
+
+def _get_arg(args, name, default):
+    if args is None:
+        return default
+    val = getattr(args, name, None)
+    return default if val is None else val
+
+
+def _encode_surrogate(args, gama):
+    mode = _get_arg(args, 'dS_du', 'Gamma')
+    if mode == 'sigmoid':
+        surrogate_mode = 0
+    elif mode in ('Gamma', 'gamma'):
+        surrogate_mode = 1
+    elif mode == 'fast_sigmoid':
+        surrogate_mode = 2
+    elif mode == 'ste':
+        surrogate_mode = 3
+    else:
+        raise ValueError(f"Unsupported dS_du {mode!r} in Triton kernel")
+    surrogate_alpha = float(_get_arg(args, 'surrogate_alpha', 4.0))
+    surrogate_gamma = float(_get_arg(args, 'surrogate_gamma', gama))
+    return surrogate_mode, surrogate_alpha, surrogate_gamma
+
+
 # ---------------------------------------------------------------------------
 # Triton Fused Forward Kernel
 # ---------------------------------------------------------------------------
@@ -16,7 +41,7 @@ def _lif_forward_kernel(
     N,                      # total number of spatial/batch elements
     thresh,                 # threshold V_th
     decay,                  # decay constant (1 - 1/tau)
-    input_scale,            # input scale (1/tau)
+    input_scale,            # input scale (1/tau or decoupled)
     reset_mode: tl.constexpr, # 0 = hard reset, 1 = soft reset
     BLOCK_SIZE: tl.constexpr
 ):
@@ -29,7 +54,7 @@ def _lif_forward_kernel(
     for t in range(T):
         curr_offset = t * N + offsets
         x_val = tl.load(x_ptr + curr_offset, mask=mask, other=0.0).to(tl.float32)
-        
+
         # Membrane potential before spike: mem * decay + x * input_scale
         mem_before = mem * decay + x_val * input_scale
         tl.store(mem_before_ptr + curr_offset, mem_before, mask=mask)
@@ -39,14 +64,14 @@ def _lif_forward_kernel(
         tl.store(spikes_ptr + curr_offset, spike, mask=mask)
 
         # Reset dynamics
-        if reset_mode == 1: # soft reset: mem = mem_before - thresh * spike
+        if reset_mode == 1:  # soft reset: mem = mem_before - thresh * spike
             mem = mem_before - thresh * spike
-        else: # hard reset: mem = mem_before * (1 - spike)
+        else:  # hard reset: mem = mem_before * (1 - spike)
             mem = mem_before * (1.0 - spike)
 
 
 # ---------------------------------------------------------------------------
-# Triton Fused Backward Kernel (LIF Baseline & Conservative C-Grad)
+# Triton Fused Backward Kernel (LIF Baseline & Legacy Conservative C-Grad)
 # ---------------------------------------------------------------------------
 @triton.jit
 def _lif_conservative_backward_kernel(
@@ -60,7 +85,7 @@ def _lif_conservative_backward_kernel(
     decay,
     input_scale,
     gama,
-    surrogate_mode: tl.constexpr, # 0 = sigmoid, 1 = gamma
+    surrogate_mode: tl.constexpr, # 0 = sigmoid, 1 = gamma, 2 = fast_sigmoid, 3 = ste
     surrogate_alpha,
     reset_mode: tl.constexpr,     # 0 = hard, 1 = soft
     detach_reset: tl.constexpr,   # 0 = False, 1 = True
@@ -91,21 +116,26 @@ def _lif_conservative_backward_kernel(
         dL_dU2 = grad_memb_last * decay
 
         # Surrogate gradient dS/dU1
-        if surrogate_mode == 0: # sigmoid
+        if surrogate_mode == 0:  # sigmoid
             sgax = (u1 - thresh) * surrogate_alpha
             sig = tl.sigmoid(sgax)
             dS_dU1 = (1.0 - sig) * sig * surrogate_alpha
-        else: # gamma (triangular)
+        elif surrogate_mode == 2:  # fast_sigmoid
+            denom = surrogate_alpha * tl.abs(u1 - thresh) + 1.0
+            dS_dU1 = 1.0 / (denom * denom)
+        elif surrogate_mode == 3:  # ste
+            dS_dU1 = tl.where(tl.abs(u1 - thresh) < 0.8, 1.0, 0.05)
+        else:  # gamma (triangular)
             dist = tl.abs(u1 - thresh)
             dS_dU1 = (1.0 / (gama * gama)) * tl.maximum(0.0, gama - dist)
 
         # Standard temporal Jacobian dU2/dU1
-        if reset_mode == 1: # soft reset
+        if reset_mode == 1:  # soft reset
             if detach_reset == 1:
                 dU2_dU1_standard = 1.0
             else:
                 dU2_dU1_standard = 1.0 - thresh * dS_dU1
-        else: # hard reset
+        else:  # hard reset
             if detach_reset == 1:
                 dU2_dU1_standard = 1.0 - spike
             else:
@@ -114,10 +144,10 @@ def _lif_conservative_backward_kernel(
         # Base gradient (standard BPTT)
         base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
 
-        if cgrad_mode == 1: # conservative_cgrad
-            if reset_mode == 1: # soft reset
+        if cgrad_mode == 1:  # legacy conservative_cgrad
+            if reset_mode == 1:  # soft reset
                 term_supra = (2.0 * thresh - u1) * dL_dU2 - dL_dS
-            else: # hard reset
+            else:  # hard reset
                 term_supra = (thresh * dL_dU2) - dL_dS
             term_sub = dL_dS - (u1 * dL_dU2)
 
@@ -134,7 +164,6 @@ def _lif_conservative_backward_kernel(
             intervention_signal = g_m * g_d * g_misalign
             do_intervene = tl.where(intervention_signal > intervention_threshold, 1.0, 0.0)
 
-            # Problem-aware correction
             sign_m_grad = tl.where(m_grad > 0.0, 1.0, tl.where(m_grad < 0.0, -1.0, 0.0))
             soft_correction = sign_m_grad * (tl.abs(base_function) * 0.5)
 
@@ -147,6 +176,129 @@ def _lif_conservative_backward_kernel(
         grad_memb_last = dL_dU1
 
         # Store gradient with respect to x[t]
+        grad_x_val = grad_memb_last * input_scale
+        tl.store(grad_x_ptr + curr_offset, grad_x_val, mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# Triton Fused 1-Pass Backward Kernel (Improved C-Grad)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _lif_improved_cgrad_backward_kernel(
+    grad_output_ptr,        # [T, N] dL/dS
+    mem_before_ptr,         # [T, N] u1
+    spikes_ptr,             # [T, N] S
+    grad_x_ptr,             # [T, N] dL/dx output
+    T: tl.constexpr,        # timesteps
+    N,                      # total elements
+    thresh,
+    decay,
+    input_scale,
+    surrogate_mode: tl.constexpr, # 0 = sigmoid, 1 = gamma, 2 = fast_sigmoid, 3 = ste
+    surrogate_alpha,
+    surrogate_gamma,
+    reset_mode: tl.constexpr,     # 0 = hard, 1 = soft
+    detach_reset: tl.constexpr,   # 0 = False, 1 = True
+    is_zero_eta: tl.constexpr,    # 1 = pure BPTT (eta == 0.0)
+    norm_mode: tl.constexpr,      # 0 = none, 1 = local
+    harmful_only: tl.constexpr,   # 0 = two-sided |m_eff|, 1 = harmful m_eff > 0
+    use_sharp_gate: tl.constexpr, # 1 = thresholded sigmoid, 0 = smooth [0, 1] clamp
+    epsilon,
+    alpha_m,
+    beta_d,
+    alpha_mis,
+    margin_m,
+    h_thresh,
+    gamma_sharp,
+    corr_scale,
+    eta,
+    BLOCK_SIZE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+
+    grad_memb_last = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+    for step in range(T):
+        t = T - 1 - step
+        curr_offset = t * N + offsets
+
+        dL_dS = tl.load(grad_output_ptr + curr_offset, mask=mask, other=0.0).to(tl.float32)
+        u1 = tl.load(mem_before_ptr + curr_offset, mask=mask, other=0.0).to(tl.float32)
+        spike = tl.load(spikes_ptr + curr_offset, mask=mask, other=0.0).to(tl.float32)
+
+        dL_dU2 = grad_memb_last * decay
+
+        if surrogate_mode == 0:  # sigmoid
+            sgax = (u1 - thresh) * surrogate_alpha
+            sig = tl.sigmoid(sgax)
+            dS_dU1 = (1.0 - sig) * sig * surrogate_alpha
+        elif surrogate_mode == 2:  # fast_sigmoid
+            denom = surrogate_alpha * tl.abs(u1 - thresh) + 1.0
+            dS_dU1 = 1.0 / (denom * denom)
+        elif surrogate_mode == 3:  # ste
+            dS_dU1 = tl.where(tl.abs(u1 - thresh) < 0.8, 1.0, 0.05)
+        else:  # gamma (triangular)
+            dist = tl.abs(u1 - thresh)
+            dS_dU1 = (1.0 / (surrogate_gamma * surrogate_gamma)) * tl.maximum(0.0, surrogate_gamma - dist)
+
+        if reset_mode == 1:  # soft reset
+            if detach_reset == 1:
+                dU2_dU1_standard = 1.0
+            else:
+                dU2_dU1_standard = 1.0 - thresh * dS_dU1
+        else:  # hard reset
+            if detach_reset == 1:
+                dU2_dU1_standard = 1.0 - spike
+            else:
+                dU2_dU1_standard = (1.0 - spike) - (u1 * dS_dU1)
+
+        base_function = dL_dS * dS_dU1 + dL_dU2 * dU2_dU1_standard
+
+        if is_zero_eta == 1:
+            dL_dU1 = base_function
+        else:
+            if reset_mode == 1:
+                term_supra = (2.0 * thresh - u1) * dL_dU2 - dL_dS
+            else:
+                term_supra = thresh * dL_dU2 - dL_dS
+            term_sub = dL_dS - u1 * dL_dU2
+
+            m = tl.where(u1 < thresh, term_sub, term_supra)
+            m_grad = tl.where(u1 < thresh, m, -m)
+            delta = u1 - thresh
+
+            if norm_mode == 1:  # local
+                err_scale = tl.abs(dL_dS) + tl.abs(thresh * dL_dU2) + 1e-12
+                m_eff = m / err_scale
+                misalignment = (-m_grad / err_scale) * (base_function / err_scale)
+            else:  # none
+                m_eff = m
+                misalignment = -m_grad * base_function
+
+            if harmful_only == 1:
+                m_score = m_eff
+            else:
+                m_score = tl.abs(m_eff)
+
+            g_m = tl.sigmoid(alpha_m * (m_score - margin_m))
+            g_d = tl.sigmoid(beta_d * (epsilon - tl.abs(delta)))
+            g_misalign = tl.sigmoid(alpha_mis * misalignment)
+
+            intervention_signal = g_m * g_d * g_misalign
+            if use_sharp_gate == 1:
+                do_intervene = tl.where(intervention_signal > h_thresh, 1.0, 0.0)
+                blend_factor = do_intervene * tl.sigmoid(gamma_sharp * (intervention_signal - h_thresh))
+            else:
+                blend_factor = tl.minimum(1.0, tl.maximum(0.0, intervention_signal))
+
+            sign_m_grad = tl.where(m_grad > 0.0, 1.0, tl.where(m_grad < 0.0, -1.0, 0.0))
+            soft_correction = sign_m_grad * (tl.abs(base_function) * corr_scale)
+            w = eta * blend_factor
+            dL_dU1 = (1.0 - w) * base_function + w * soft_correction
+
+        grad_memb_last = dL_dU1
         grad_x_val = grad_memb_last * input_scale
         tl.store(grad_x_ptr + curr_offset, grad_x_val, mask=mask)
 
@@ -188,6 +340,11 @@ def _invariant_cgrad_reduce_kernel(
         sgax = (u1 - thresh) * surrogate_alpha
         sig = tl.sigmoid(sgax)
         dS_dU1 = (1.0 - sig) * sig * surrogate_alpha
+    elif surrogate_mode == 2:
+        denom = surrogate_alpha * tl.abs(u1 - thresh) + 1.0
+        dS_dU1 = 1.0 / (denom * denom)
+    elif surrogate_mode == 3:
+        dS_dU1 = tl.where(tl.abs(u1 - thresh) < 0.8, 1.0, 0.05)
     else:
         dist = tl.abs(u1 - thresh)
         dS_dU1 = (1.0 / (gama * gama)) * tl.maximum(0.0, gama - dist)
@@ -214,7 +371,7 @@ def _invariant_cgrad_reduce_kernel(
     m = tl.where(u1 < thresh, term_sub, term_supra)
 
     rho = thresh - u1
-    if consistency_sign == 0: # 'product'
+    if consistency_sign == 0:  # 'product'
         dL_pred = rho * base_function
     else:
         dL_pred = tl.where(u1 < thresh, base_function, -base_function) * thresh
@@ -301,6 +458,11 @@ def _invariant_cgrad_step_kernel(
         sgax = (u1 - thresh) * surrogate_alpha
         sig = tl.sigmoid(sgax)
         dS_dU1 = (1.0 - sig) * sig * surrogate_alpha
+    elif surrogate_mode == 2:
+        denom = surrogate_alpha * tl.abs(u1 - thresh) + 1.0
+        dS_dU1 = 1.0 / (denom * denom)
+    elif surrogate_mode == 3:
+        dS_dU1 = tl.where(tl.abs(u1 - thresh) < 0.8, 1.0, 0.05)
     else:
         dist = tl.abs(u1 - thresh)
         dS_dU1 = (1.0 / (gama * gama)) * tl.maximum(0.0, gama - dist)
@@ -349,7 +511,7 @@ def _invariant_cgrad_step_kernel(
     g_d = tl.sigmoid(alpha_d * (epsilon - tl.abs(delta)))
 
     # Gate 3: Consistency
-    if consistency_sign == 2: # sign mode
+    if consistency_sign == 2:  # sign mode
         sign_m_hat = tl.where(m_hat > 0.0, 1.0, tl.where(m_hat < 0.0, -1.0, 0.0))
         sign_pred_hat = tl.where(pred_hat > 0.0, 1.0, tl.where(pred_hat < 0.0, -1.0, 0.0))
         g_cons = tl.sigmoid(alpha_cons * (-sign_m_hat * sign_pred_hat))
@@ -368,11 +530,11 @@ def _invariant_cgrad_step_kernel(
     blend_factor = do_intervene * tl.sigmoid(gamma * (intervention_signal - intervention_threshold))
     w = eta * blend_factor
 
-    if correction_mode == 1: # mask
+    if correction_mode == 1:  # mask
         dL_dU1 = (1.0 - do_intervene) * base_function
-    elif correction_mode == 2: # flip
+    elif correction_mode == 2:  # flip
         dL_dU1 = tl.where(do_intervene > 0.0, soft_correction, base_function)
-    else: # blend
+    else:  # blend
         dL_dU1 = (1.0 - w) * base_function + w * soft_correction
 
     # Store updated gradient accumulator in-place for next step
@@ -396,14 +558,14 @@ def triton_lif_forward(x, thresh=1.0, decay=0.5, input_scale=0.5, reset_mode='ha
     T = orig_shape[0]
     N = x[0].numel()
     x_2d = x.contiguous().view(T, N)
-    
+
     spikes = torch.empty_like(x_2d)
     mem_before_spikes = torch.empty_like(x_2d)
-    
+
     reset_flag = 1 if reset_mode == 'soft' else 0
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(N, BLOCK_SIZE),)
-    
+
     _lif_forward_kernel[grid](
         x_2d,
         spikes,
@@ -414,9 +576,9 @@ def triton_lif_forward(x, thresh=1.0, decay=0.5, input_scale=0.5, reset_mode='ha
         decay=float(decay),
         input_scale=float(input_scale),
         reset_mode=reset_flag,
-        BLOCK_SIZE=BLOCK_SIZE
+        BLOCK_SIZE=BLOCK_SIZE,
     )
-    
+
     return spikes.view(orig_shape), mem_before_spikes.view(orig_shape)
 
 
@@ -433,33 +595,32 @@ def triton_lif_backward_conservative(
     reset_mode='hard'
 ):
     """
-    Fused 1-pass backward for standard LIF / TET / conservative_cgrad.
+    Fused 1-pass backward for standard LIF / TET / legacy conservative_cgrad.
     """
     orig_shape = grad_output.shape
     T = orig_shape[0]
     N = grad_output[0].numel()
-    
+
     grad_out_2d = grad_output.contiguous().view(T, N)
     mem_2d = mem_before_spikes.contiguous().view(T, N)
     spikes_2d = spikes.contiguous().view(T, N)
     grad_x_2d = torch.empty_like(grad_out_2d)
-    
-    surrogate_mode = 0 if getattr(args, 'dS_du', 'Gamma') == 'sigmoid' else 1
-    surrogate_alpha = float(getattr(args, 'surrogate_alpha', 4.0))
+
+    surrogate_mode, surrogate_alpha, surrogate_gamma = _encode_surrogate(args, gama)
     reset_flag = 1 if reset_mode == 'soft' else 0
     detach_flag = 1 if detach_reset else 0
-    
-    mode = getattr(args, 'du_du', 'LIF')
+
+    mode = _get_arg(args, 'du_du', 'LIF')
     cgrad_flag = 1 if mode == 'conservative_cgrad' else 0
-    
-    alpha_m = float(getattr(args, 'snnbp_alpha', 2.0))
-    alpha_d = float(getattr(args, 'snnbp_beta', 2.0))
-    epsilon = float(getattr(args, 'snnbp_epsilon', 0.3))
-    intervention_threshold = float(getattr(args, 'snnbp_intervention', 0.8))
-    
+
+    alpha_m = float(_get_arg(args, 'snnbp_alpha', 2.0))
+    alpha_d = float(_get_arg(args, 'snnbp_beta', 2.0))
+    epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.3))
+    intervention_threshold = float(_get_arg(args, 'snnbp_intervention', 0.8))
+
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(N, BLOCK_SIZE),)
-    
+
     _lif_conservative_backward_kernel[grid](
         grad_out_2d,
         mem_2d,
@@ -470,7 +631,7 @@ def triton_lif_backward_conservative(
         thresh=float(thresh),
         decay=float(decay),
         input_scale=float(input_scale),
-        gama=float(gama),
+        gama=float(surrogate_gamma),
         surrogate_mode=surrogate_mode,
         surrogate_alpha=surrogate_alpha,
         reset_mode=reset_flag,
@@ -480,9 +641,96 @@ def triton_lif_backward_conservative(
         alpha_d=alpha_d,
         epsilon=epsilon,
         intervention_threshold=intervention_threshold,
-        BLOCK_SIZE=BLOCK_SIZE
+        BLOCK_SIZE=BLOCK_SIZE,
     )
-    
+
+    return grad_x_2d.view(orig_shape)
+
+
+def triton_lif_backward_improved(
+    grad_output,
+    mem_before_spikes,
+    spikes,
+    thresh=1.0,
+    decay=0.5,
+    input_scale=0.5,
+    gama=1.0,
+    args=None,
+    detach_reset=False,
+    reset_mode='hard'
+):
+    """
+    Fused 1-pass backward for improved_cgrad (supports 'local' and 'none' norms).
+    """
+    orig_shape = grad_output.shape
+    T = orig_shape[0]
+    N = grad_output[0].numel()
+
+    grad_out_2d = grad_output.contiguous().view(T, N)
+    mem_2d = mem_before_spikes.contiguous().view(T, N)
+    spikes_2d = spikes.contiguous().view(T, N)
+    grad_x_2d = torch.empty_like(grad_out_2d)
+
+    surrogate_mode, surrogate_alpha, surrogate_gamma = _encode_surrogate(args, gama)
+    reset_flag = 1 if reset_mode == 'soft' else 0
+    detach_flag = 1 if detach_reset else 0
+
+    eta = float(_get_arg(args, 'snnbp_eta', 1.0))
+    is_zero_eta = 1 if eta == 0.0 else 0
+
+    norm_str = _get_arg(args, 'snnbp_norm', 'local')
+    if norm_str == 'local':
+        norm_mode = 1
+    elif norm_str == 'none':
+        norm_mode = 0
+    else:
+        raise ValueError(f"Triton improved_cgrad supports snnbp_norm in ('local', 'none'), got {norm_str!r}")
+
+    harmful_only = 1 if bool(_get_arg(args, 'snnbp_harmful_only', True)) else 0
+    epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.35))
+    alpha_m = float(_get_arg(args, 'snnbp_alpha', 3.0))
+    beta_d = float(_get_arg(args, 'snnbp_beta', 8.0))
+    alpha_mis = float(_get_arg(args, 'snnbp_alpha_mis', alpha_m))
+    margin_m = float(_get_arg(args, 'snnbp_margin_m', 0.0))
+    h_thresh = float(_get_arg(args, 'snnbp_intervention', 0.0))
+    gamma_sharp = float(_get_arg(args, 'snnbp_gamma_sharp', 0.0))
+    corr_scale = float(_get_arg(args, 'snnbp_corr_scale', 0.5))
+    use_sharp_gate = 1 if gamma_sharp > 0.0 else 0
+
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+
+    _lif_improved_cgrad_backward_kernel[grid](
+        grad_out_2d,
+        mem_2d,
+        spikes_2d,
+        grad_x_2d,
+        T=T,
+        N=N,
+        thresh=float(thresh),
+        decay=float(decay),
+        input_scale=float(input_scale),
+        surrogate_mode=surrogate_mode,
+        surrogate_alpha=surrogate_alpha,
+        surrogate_gamma=surrogate_gamma,
+        reset_mode=reset_flag,
+        detach_reset=detach_flag,
+        is_zero_eta=is_zero_eta,
+        norm_mode=norm_mode,
+        harmful_only=harmful_only,
+        use_sharp_gate=use_sharp_gate,
+        epsilon=epsilon,
+        alpha_m=alpha_m,
+        beta_d=beta_d,
+        alpha_mis=alpha_mis,
+        margin_m=margin_m,
+        h_thresh=h_thresh,
+        gamma_sharp=gamma_sharp,
+        corr_scale=corr_scale,
+        eta=eta,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
     return grad_x_2d.view(orig_shape)
 
 
@@ -504,63 +752,61 @@ def triton_lif_backward_invariant(
     orig_shape = grad_output.shape
     T = orig_shape[0]
     N = grad_output[0].numel()
-    
+
     grad_out_2d = grad_output.contiguous().view(T, N)
     mem_2d = mem_before_spikes.contiguous().view(T, N)
     spikes_2d = spikes.contiguous().view(T, N)
     grad_x_2d = torch.empty_like(grad_out_2d)
-    
-    surrogate_mode = 0 if getattr(args, 'dS_du', 'Gamma') == 'sigmoid' else 1
-    surrogate_alpha = float(getattr(args, 'surrogate_alpha', 4.0))
+
+    surrogate_mode, surrogate_alpha, surrogate_gamma = _encode_surrogate(args, gama)
     reset_flag = 1 if reset_mode == 'soft' else 0
     detach_flag = 1 if detach_reset else 0
-    
-    consistency_str = getattr(args, 'snnbp_consistency', 'product')
+
+    consistency_str = _get_arg(args, 'snnbp_consistency', 'product')
     if consistency_str == 'product':
         consistency_sign = 0
     elif consistency_str == 'ref':
         consistency_sign = 1
-    else: # 'sign'
+    else:  # 'sign'
         consistency_sign = 2
-        
-    alpha_m = float(getattr(args, 'snnbp_alpha', 2.0))
-    alpha_d = float(getattr(args, 'snnbp_beta', 2.0))
-    alpha_cons = float(getattr(args, 'snnbp_alpha_cons', 2.0))
-    epsilon = float(getattr(args, 'snnbp_epsilon', 0.3))
-    kappa = float(getattr(args, 'snnbp_kappa', 1.0))
-    intervention_threshold = float(getattr(args, 'snnbp_h', 0.5))
-    eta = float(getattr(args, 'snnbp_eta', 0.5))
-    gamma = float(getattr(args, 'snnbp_gamma', 5.0))
-    two_sided = bool(getattr(args, 'snnbp_two_sided', True))
-    
-    corr_str = getattr(args, 'snnbp_correction', 'blend')
+
+    alpha_m = float(_get_arg(args, 'snnbp_alpha', 2.0))
+    alpha_d = float(_get_arg(args, 'snnbp_beta', 2.0))
+    alpha_cons = float(_get_arg(args, 'snnbp_alpha_cons', 2.0))
+    epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.3))
+    kappa = float(_get_arg(args, 'snnbp_kappa', 1.0))
+    intervention_threshold = float(_get_arg(args, 'snnbp_h', 0.5))
+    eta = float(_get_arg(args, 'snnbp_eta', 0.5))
+    gamma = float(_get_arg(args, 'snnbp_gamma', 5.0))
+    two_sided = bool(_get_arg(args, 'snnbp_two_sided', True))
+
+    corr_str = _get_arg(args, 'snnbp_correction', 'blend')
     if corr_str == 'mask':
         correction_mode = 1
     elif corr_str == 'flip':
         correction_mode = 2
     else:
         correction_mode = 0
-        
+
     BLOCK_SIZE = 1024
     num_blocks = triton.cdiv(N, BLOCK_SIZE)
     grid = (num_blocks,)
-    
+
     # Running membrane gradient accumulator and reduction buffers in FP32
     grad_memb_last = torch.zeros(N, device=grad_output.device, dtype=torch.float32)
     partial_m2 = torch.empty(num_blocks, device=grad_output.device, dtype=torch.float32)
     partial_pred2 = torch.empty(num_blocks, device=grad_output.device, dtype=torch.float32)
     norm_val_tensor = torch.empty(1, device=grad_output.device, dtype=torch.float32)
-    
+
     RED_BLOCK_SIZE = triton.next_power_of_2(max(1, num_blocks))
-    
+
     for step in range(T):
         t = T - 1 - step
         dL_dS_t = grad_out_2d[t]
         u1_t = mem_2d[t]
         spike_t = spikes_2d[t]
         grad_x_t = grad_x_2d[t]
-        
-        # 1. Fast parallel reduction pass
+
         _invariant_cgrad_reduce_kernel[grid](
             dL_dS_t,
             u1_t,
@@ -571,26 +817,24 @@ def triton_lif_backward_invariant(
             N=N,
             thresh=float(thresh),
             decay=float(decay),
-            gama=float(gama),
+            gama=float(surrogate_gamma),
             surrogate_mode=surrogate_mode,
             surrogate_alpha=surrogate_alpha,
             reset_mode=reset_flag,
             detach_reset=detach_flag,
             consistency_sign=consistency_sign,
-            BLOCK_SIZE=BLOCK_SIZE
+            BLOCK_SIZE=BLOCK_SIZE,
         )
-        
-        # 2. Compute scalar norm on GPU without CPU host sync
+
         _invariant_compute_norm_kernel[(1,)](
             partial_m2,
             partial_pred2,
             norm_val_tensor,
             num_blocks=num_blocks,
             N=N,
-            BLOCK_SIZE=RED_BLOCK_SIZE
+            BLOCK_SIZE=RED_BLOCK_SIZE,
         )
-        
-        # 3. Fused step update kernel
+
         _invariant_cgrad_step_kernel[grid](
             dL_dS_t,
             u1_t,
@@ -602,7 +846,7 @@ def triton_lif_backward_invariant(
             thresh=float(thresh),
             decay=float(decay),
             input_scale=float(input_scale),
-            gama=float(gama),
+            gama=float(surrogate_gamma),
             surrogate_mode=surrogate_mode,
             surrogate_alpha=surrogate_alpha,
             reset_mode=reset_flag,
@@ -618,9 +862,9 @@ def triton_lif_backward_invariant(
             gamma=gamma,
             two_sided=two_sided,
             correction_mode=correction_mode,
-            BLOCK_SIZE=BLOCK_SIZE
+            BLOCK_SIZE=BLOCK_SIZE,
         )
-        
+
     return grad_x_2d.view(orig_shape)
 
 
@@ -645,8 +889,8 @@ class TritonTimeParallel_LIFSpike(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         mem_before, spikes, x, gama = ctx.saved_tensors
-        mode = getattr(ctx.args, 'du_du', 'LIF')
-        
+        mode = _get_arg(ctx.args, 'du_du', 'LIF')
+
         if mode == 'invariant_cgrad':
             grad_x = triton_lif_backward_invariant(
                 grad_output=grad_output,
@@ -658,7 +902,20 @@ class TritonTimeParallel_LIFSpike(torch.autograd.Function):
                 gama=gama.item(),
                 args=ctx.args,
                 detach_reset=ctx.detach_reset,
-                reset_mode=ctx.reset_mode
+                reset_mode=ctx.reset_mode,
+            )
+        elif mode == 'improved_cgrad':
+            grad_x = triton_lif_backward_improved(
+                grad_output=grad_output,
+                mem_before_spikes=mem_before,
+                spikes=spikes,
+                thresh=ctx.thresh,
+                decay=ctx.decay,
+                input_scale=ctx.input_scale,
+                gama=gama.item(),
+                args=ctx.args,
+                detach_reset=ctx.detach_reset,
+                reset_mode=ctx.reset_mode,
             )
         else:
             grad_x = triton_lif_backward_conservative(
@@ -671,7 +928,7 @@ class TritonTimeParallel_LIFSpike(torch.autograd.Function):
                 gama=gama.item(),
                 args=ctx.args,
                 detach_reset=ctx.detach_reset,
-                reset_mode=ctx.reset_mode
+                reset_mode=ctx.reset_mode,
             )
-            
+
         return grad_x, None, None, None, None, None, None, None

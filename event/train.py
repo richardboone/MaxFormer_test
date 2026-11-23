@@ -1,4 +1,5 @@
 import datetime
+import json
 import os
 import time
 
@@ -160,18 +161,25 @@ def parse_args():
     #Extra consistency parameters
     parser.add_argument('--du-du', type=str, default='complex54', help='Feedback gradient mode')
     parser.add_argument('--dS-du', type=str, default='Gamma', help='Surrogate gradient mode')
-    parser.add_argument('--snnbp-alpha', type=float, default=1.1742)
-    parser.add_argument('--snnbp-beta', type=float, default=0.9245)
-    parser.add_argument('--snnbp-epsilon', type=float, default=0.3468)
-    parser.add_argument('--snnbp-p', type=float, default=9.5334)
+    parser.add_argument('--snnbp-alpha', type=float, default=None)
+    parser.add_argument('--snnbp-beta', type=float, default=None)
+    parser.add_argument('--snnbp-epsilon', type=float, default=None)
+    parser.add_argument('--snnbp-p', type=float, default=None)
     parser.add_argument('--snnbp-k-dir', type=float, default=1.0)
-    parser.add_argument('--snnbp-tau', type=float, default=0.5, help='Decay factor (0.5 ~= tau 2.0)')
-    # New hyperparameters for stabilized gradient methods
+    parser.add_argument('--snnbp-tau', type=float, default=0.5, help='Decay factor (<1.0) or time constant tau (>=1.0)')
+    parser.add_argument('--snnbp-input-scale', type=str, default=None, help='Input scaling ("coupled"/"1/tau" or float)')
+    # New hyperparameters for stabilized / invariant / improved gradient methods
     parser.add_argument('--snnbp-max-ratio', type=float, default=3.0, help='stable_cgrad: max gradient multiplier vs base')
     parser.add_argument('--snnbp-decay', type=float, default=0.5, help='adaptive_cgrad: trust decay for large base gradients')
-    parser.add_argument('--snnbp-intervention', type=float, default=0.8, help='conservative_cgrad: confidence threshold for intervention')
-    parser.add_argument('--snnbp-eta', type=float, default=0.5, help='conservative_cgrad: correction magnitude constant')
+    parser.add_argument('--snnbp-intervention', type=float, default=None, help='confidence threshold h for intervention')
+    parser.add_argument('--snnbp-eta', type=float, default=None, help='correction strength eta (0.0 recovers plain BPTT)')
     parser.add_argument('--snnbp-blend', type=float, default=0.5, help='conservative_cgrad: blend scale factor')
+    parser.add_argument('--snnbp-norm', type=str, default=None, choices=['local', 'rms', 'none'], help='improved_cgrad: normalization mode')
+    parser.add_argument('--snnbp-harmful-only', type=str2bool, default=None, help='improved_cgrad: gate only on m_eff > 0 instead of |m_eff|')
+    parser.add_argument('--snnbp-alpha-mis', type=float, default=None, help='improved_cgrad: misalignment gate steepness')
+    parser.add_argument('--snnbp-margin-m', type=float, default=None, help='improved_cgrad: normalized harmfulness margin')
+    parser.add_argument('--snnbp-gamma-sharp', type=float, default=None, help='improved_cgrad: sharpness around threshold h (0 = smooth product)')
+    parser.add_argument('--snnbp-corr-scale', type=float, default=None, help='improved_cgrad: relative correction magnitude scale')
     parser.add_argument('--snnbp-alpha-cons', type=float, default=2.0, help='invariant_cgrad: steepness of the consistency gate')
     parser.add_argument('--snnbp-kappa', type=float, default=1.0, help='invariant_cgrad: harmfulness margin, relative to per-layer RMS of m')
     parser.add_argument('--snnbp-h', type=float, default=0.5, help='invariant_cgrad: intervention threshold (separate from --snnbp-intervention, whose 0.8 default would make this mode a no-op)')
@@ -185,10 +193,12 @@ def parse_args():
                         help='invariant_cgrad: what an intervention does. blend = Algorithm 1 eta-weighted interpolation (default); '
                              'mask = zero the entry (suppress rather than redirect); flip = commit fully to the corrective direction. '
                              'mask and flip ignore snnbp-eta and snnbp-gamma.')
-    parser.add_argument('--log-cgrad-stats', type=str2bool, default=False, help='invariant_cgrad: accumulate and log the intervention rate (essential for sweeps: a config whose gate never opens is otherwise indistinguishable from a good one)')
-    parser.add_argument('--cgrad-stats-prob', type=float, default=0.125, help='fraction of backward calls sampled for --log-cgrad-stats')
+    parser.add_argument('--log-cgrad-stats', type=str2bool, default=False, help='accumulate and log intervention rate statistics')
+    parser.add_argument('--cgrad-stats-prob', type=float, default=0.05, help='fraction of layer calls sampled for --log-cgrad-stats')
     parser.add_argument('--metric-window', type=int, default=10, help='window k for the val/mean_last{k} sweep objective')
+    parser.add_argument('--summary-json', type=str, default='', help='optional path to write atomic JSON run summary')
     parser.add_argument('--surrogate-alpha', type=float, default=4.0, help='Alpha for sigmoid surrogate gradient')
+    parser.add_argument('--surrogate-gamma', type=float, default=None, help='Gamma width for Gamma surrogate gradient')
     parser.add_argument('--gama', type=float, default=1.0)
     parser.add_argument('--use-custom-neuron', type=str2bool, nargs='?', const=True, default=True, help='Use custom neuron implementation')
     parser.add_argument('--early-stop-patience', default=-1, type=int, 
@@ -245,11 +255,20 @@ def split_to_train_test_set(train_ratio: float, origin_dataset: torch.utils.data
     for i in range(num_classes):
         label_idx.append([])
 
-    for i, item in enumerate(origin_dataset):
-        y = item[1]
-        if isinstance(y, np.ndarray) or isinstance(y, torch.Tensor):
-            y = y.item()
-        label_idx[y].append(i)
+    targets = getattr(origin_dataset, 'targets', None)
+    if targets is None and hasattr(origin_dataset, 'samples'):
+        targets = [s[1] for s in origin_dataset.samples]
+    if targets is not None:
+        for i, y in enumerate(targets):
+            if isinstance(y, (np.ndarray, torch.Tensor)):
+                y = y.item()
+            label_idx[int(y)].append(i)
+    else:
+        for i, item in enumerate(origin_dataset):
+            y = item[1]
+            if isinstance(y, np.ndarray) or isinstance(y, torch.Tensor):
+                y = y.item()
+            label_idx[y].append(i)
     train_idx = []
     test_idx = []
     if random_split:
@@ -385,6 +404,15 @@ def load_data(dataset, dataset_dir, distributed, T):
     return dataset_train, dataset_test, train_sampler, test_sampler
 
 
+def _write_json_atomic(path, payload):
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
+
+
 def main(args):
     # Pass args to the custom neuron module
     custom_neuron.set_global_args(args)
@@ -394,28 +422,59 @@ def main(args):
     print(f" [Neuron]  du_du: {args.du_du} | dS_du: {args.dS_du}")
     print(f"=======================================================\n")
 
+    wandb_active = False
     if args.log_wandb:
         if has_wandb:
-            wandb.init(project="maxformer_event", 
-                       name=args.experiment if args.experiment else None,
-                       config=dict(**vars(args), triton_enabled=triton_enabled))
+            wandb_cfg = dict(**vars(args), triton_enabled=triton_enabled)
+            try:
+                wandb.init(
+                    project="maxformer_event",
+                    name=args.experiment if args.experiment else None,
+                    config=wandb_cfg,
+                )
+                wandb_active = True
+            except Exception as exc:
+                print(f"[WARN] wandb online init failed ({exc}); falling back to offline mode.")
+                try:
+                    wandb.init(
+                        project="maxformer_event",
+                        name=args.experiment if args.experiment else None,
+                        config=wandb_cfg,
+                        mode="offline",
+                    )
+                    wandb_active = True
+                except Exception as exc2:
+                    print(f"[WARN] wandb offline init also failed ({exc2}); continuing without wandb.")
         else:
             print("You've requested to log metrics to wandb but package not found. "
                   "Metrics not being logged to wandb, try `pip install wandb`")
-    
+
+    summary_path = args.summary_json
+    if not summary_path and args.experiment:
+        summary_path = os.path.join("./logs/eval_summaries", f"{args.experiment}.json")
+    epochs_jsonl_path = None
+    if summary_path:
+        stem = summary_path[:-5] if summary_path.endswith(".json") else summary_path
+        epochs_jsonl_path = f"{stem}.epochs.jsonl"
+        os.makedirs(os.path.dirname(os.path.abspath(summary_path)), exist_ok=True)
+
     max_test_acc1 = 0.
     test_acc5_at_max_test_acc1 = 0.
     test_acc_history = []
+    epoch_times = []
+    cgrad_stats_history = []
+    val_mean_last_k = 0.0
+    final_test_acc1 = 0.0
+    epochs_completed = 0
+    total_epochs_target = args.epochs
+    run_status = "running"
+    run_error = None
 
     utils.init_distributed_mode(args)
     print(args)
 
     if args.log_wandb:
-        # Metrics-only: everything worth keeping goes to wandb. The local output_dir
-        # is keyed solely on model/batch/T/weight-decay/optimizer/lr, all of which a
-        # sweep pins, so every run in a sweep resolves to the SAME directory and
-        # concurrent agents overwrite each other's checkpoints. An empty output_dir
-        # disables every local write below; each is guarded by `if output_dir`.
+        # Metrics-only: everything worth keeping goes to wandb and summary_json.
         output_dir = ''
     else:
         output_dir = os.path.join(args.output_dir, f'{args.model}_b{args.batch_size}_T{args.T}')
@@ -459,9 +518,10 @@ def main(args):
         dataset=dataset_test,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=args.workers,
         drop_last=False,
-        pin_memory=True)
+        pin_memory=True,
+        persistent_workers=True if args.workers > 0 else False)
 
     model = create_model(
         args.model, in_channels=2, num_classes=args.num_classes,
@@ -484,6 +544,7 @@ def main(args):
     else:
         scaler = None
     lr_scheduler, num_epochs = create_scheduler(args, optimizer)
+    total_epochs_target = num_epochs
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
@@ -514,7 +575,6 @@ def main(args):
 
         print(f'purge_step_train={purge_step_train}, purge_step_te={purge_step_te}')
 
-
     train_snn_aug = transforms.Compose([
                     transforms.RandomHorizontalFlip(p=0.5)
                     ])
@@ -532,40 +592,42 @@ def main(args):
 
     patience_counter = 0 # for early stopping
     print(f"Early stopping enabled. Patience: {args.early_stop_patience} epochs.")
-    for epoch in range(args.start_epoch, num_epochs):
-        save_max = False
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-        if epoch >= 75:
-            mixup_fn.mixup_enabled = False
-        t_epoch_start = time.perf_counter()
-        train_loss, train_acc1, train_acc5 = train_one_epoch(
-            model, criterion_train, optimizer, data_loader, device, epoch,
-            args.print_freq, scaler, args.T_train,
-            train_snn_aug, train_trivalaug, mixup_fn)
-        epoch_time_sec = time.perf_counter() - t_epoch_start
-        lr_scheduler.step(epoch + 1)
+    try:
+        for epoch in range(args.start_epoch, num_epochs):
+            save_max = False
+            if args.distributed:
+                train_sampler.set_epoch(epoch)
+            if epoch >= 75 and mixup_fn is not None:
+                mixup_fn.mixup_enabled = False
+            t_epoch_start = time.perf_counter()
+            train_loss, train_acc1, train_acc5 = train_one_epoch(
+                model, criterion_train, optimizer, data_loader, device, epoch,
+                args.print_freq, scaler, args.T_train,
+                train_snn_aug, train_trivalaug, mixup_fn)
+            epoch_time_sec = time.perf_counter() - t_epoch_start
+            epoch_times.append(epoch_time_sec)
+            lr_scheduler.step(epoch + 1)
 
-        test_loss, test_acc1, test_acc5 = evaluate(model, criterion, data_loader_test, device=device, header='Test:')
+            test_loss, test_acc1, test_acc5 = evaluate(model, criterion, data_loader_test, device=device, header='Test:')
 
-        if max_test_acc1 < test_acc1:
-            max_test_acc1 = test_acc1
-            test_acc5_at_max_test_acc1 = test_acc5
-            save_max = True
-            patience_counter = 0
-        else:
-            patience_counter += 1
+            if max_test_acc1 < test_acc1:
+                max_test_acc1 = test_acc1
+                test_acc5_at_max_test_acc1 = test_acc5
+                save_max = True
+                patience_counter = 0
+            else:
+                patience_counter += 1
 
-        # Lower-variance sweep objectives. val/max is the maximum of a noisy
-        # sequence: upward-biased, high-variance, and biased *more* for runs with
-        # jumpier curves, so optimising it structurally rewards instability. The
-        # trailing mean is a far better target when the seed-to-seed noise floor
-        # is comparable to the effect being measured.
-        test_acc_history.append(test_acc1)
-        k = args.metric_window
-        val_mean_last_k = sum(test_acc_history[-k:]) / len(test_acc_history[-k:])
+            test_acc_history.append(test_acc1)
+            final_test_acc1 = test_acc1
+            epochs_completed = len(test_acc_history)
+            k = args.metric_window
+            val_mean_last_k = sum(test_acc_history[-k:]) / len(test_acc_history[-k:])
 
-        if args.log_wandb and has_wandb:
+            cgrad_stats = custom_neuron.pop_cgrad_stats()
+            if cgrad_stats is not None:
+                cgrad_stats_history.append(cgrad_stats)
+
             log_payload = {
                 "train/loss": train_loss,
                 "train/acc1": train_acc1,
@@ -576,50 +638,95 @@ def main(args):
                 "val/acc_tp5": test_acc5,
                 "val/max": max_test_acc1,
                 f"val/mean_last{k}": val_mean_last_k,
-                "lr":  float(optimizer.param_groups[0]['lr']),
+                "lr": float(optimizer.param_groups[0]['lr']),
             }
-            cgrad_stats = custom_neuron.pop_cgrad_stats()
             if cgrad_stats is not None:
                 log_payload.update(cgrad_stats)
-            wandb.log(log_payload, step = epoch)
-        elif args.log_cgrad_stats:
-            cgrad_stats = custom_neuron.pop_cgrad_stats()
-            if cgrad_stats is not None:
+
+            if epochs_jsonl_path and utils.is_main_process():
+                epoch_rec = dict(epoch=epoch, **log_payload)
+                with open(epochs_jsonl_path, 'a', encoding='utf-8') as jf:
+                    jf.write(json.dumps(epoch_rec) + "\n")
+
+            if wandb_active:
+                try:
+                    wandb.log(log_payload, step=epoch)
+                except Exception as exc:
+                    print(f"[WARN] wandb.log failed at epoch {epoch}: {exc}")
+            elif args.log_cgrad_stats and cgrad_stats is not None:
                 print(f"  [cgrad] epoch {epoch}: "
-                      + "  ".join(f"{k.split('/')[-1]}={v:.4g}"
-                                  for k, v in cgrad_stats.items()))
+                      + "  ".join(f"{key.split('/')[-1]}={val:.4g}"
+                                  for key, val in cgrad_stats.items()))
 
-        if output_dir:
+            if output_dir:
+                checkpoint = {
+                    'model': model_without_ddp.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
+                    'epoch': epoch,
+                    'args': args,
+                    'max_test_acc1': max_test_acc1,
+                    'test_acc5_at_max_test_acc1': test_acc5_at_max_test_acc1,
+                }
 
-            checkpoint = {
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'lr_scheduler': lr_scheduler.state_dict(),
-                'epoch': epoch,
-                'args': args,
-                'max_test_acc1': max_test_acc1,
-                'test_acc5_at_max_test_acc1': test_acc5_at_max_test_acc1,
+                if save_max:
+                    utils.save_on_master(
+                        checkpoint,
+                        os.path.join(output_dir, 'checkpoint_max_test_acc1.pth'))
+            if args.early_stop_patience > 0 and patience_counter >= args.early_stop_patience:
+                if utils.is_main_process():
+                    print(f'\nEarly stopping triggered! No improvement for {args.early_stop_patience} epochs.')
+                    print(f'Best Acc: {max_test_acc1} at epoch {epoch - patience_counter}')
+                break
+            total_time = time.time() - start_time
+            total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+
+            print('Training time {}'.format(total_time_str), 'max_test_acc1', max_test_acc1, 'test_acc5_at_max_test_acc1', test_acc5_at_max_test_acc1)
+        if output_dir and epochs_completed > 0:
+            utils.save_on_master(
+                checkpoint,
+                os.path.join(output_dir, f'checkpoint_{epoch}.pth'))
+        run_status = "completed"
+    except Exception as exc:
+        run_error = f"{type(exc).__name__}: {exc}"
+        run_status = "nan_collapsed" if "loss is Nan" in str(exc) else "failed"
+        raise
+    finally:
+        if summary_path and utils.is_main_process():
+            cgrad_stats_mean = {}
+            if cgrad_stats_history:
+                all_keys = sorted(cgrad_stats_history[0].keys())
+                for key in all_keys:
+                    vals = [d[key] for d in cgrad_stats_history if key in d]
+                    if key.endswith('neuron_timesteps_sampled'):
+                        cgrad_stats_mean[key] = float(sum(vals))
+                    else:
+                        cgrad_stats_mean[key] = float(sum(vals) / len(vals))
+            summary_payload = {
+                "status": run_status,
+                "error": run_error,
+                "experiment": args.experiment,
+                "dataset": args.dataset,
+                "model": args.model,
+                "seed": args.seed,
+                "triton_enabled": triton_enabled,
+                "epochs_completed": epochs_completed,
+                "total_epochs": total_epochs_target,
+                "metric_window": args.metric_window,
+                "max_val_acc1": float(max_test_acc1),
+                "val_mean_last_k": float(val_mean_last_k),
+                f"val_mean_last{args.metric_window}": float(val_mean_last_k),
+                "final_val_acc1": float(final_test_acc1),
+                "mean_epoch_time_sec": float(sum(epoch_times) / len(epoch_times)) if epoch_times else 0.0,
+                "cgrad_stats_mean": cgrad_stats_mean,
+                "args": vars(args),
             }
-
-            if save_max:
-                utils.save_on_master(
-                    checkpoint,
-                    os.path.join(output_dir, 'checkpoint_max_test_acc1.pth'))
-        if args.early_stop_patience > 0 and patience_counter >= args.early_stop_patience:
-            if utils.is_main_process():
-                print(f'\nEarly stopping triggered! No improvement for {args.early_stop_patience} epochs.')
-                print(f'Best Acc: {max_test_acc1} at epoch {epoch - patience_counter}')
-            break
-        print(args)
-        total_time = time.time() - start_time
-        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-
-        print('Training time {}'.format(total_time_str), 'max_test_acc1', max_test_acc1, 'test_acc5_at_max_test_acc1', test_acc5_at_max_test_acc1)
-        print(output_dir)
-    if output_dir:
-        utils.save_on_master(
-            checkpoint,
-            os.path.join(output_dir, f'checkpoint_{epoch}.pth'))
+            _write_json_atomic(summary_path, summary_payload)
+        if wandb_active:
+            try:
+                wandb.finish()
+            except Exception as exc:
+                print(f"[WARN] wandb.finish failed: {exc}")
 
     return max_test_acc1
 

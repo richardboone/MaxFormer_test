@@ -279,6 +279,125 @@ ARMS = [
 ]
 
 
+PHASE1B_ARMS = [
+    {
+        "name": "X4_T8_rms",
+        "config": "./cifar10dvs_improved_cgrad.yaml",
+        "flags": [
+            "--du-du=improved_cgrad",
+            "--dS-du=sigmoid",
+            "--snnbp-tau=2.0",
+            "--snnbp-input-scale=coupled",
+            "--detach-reset=True",
+            "--snnbp-norm=rms",
+            "--snnbp-misalign-mode=product",
+            "--snnbp-harmful-only=False",
+            "--snnbp-alpha-mis=15.0",
+            "--snnbp-alpha=4.0",
+            "--snnbp-margin-m=0.25",
+            "--snnbp-epsilon=0.35",
+            "--snnbp-beta=8.0",
+            "--snnbp-intervention=0.0",
+            "--snnbp-gamma-sharp=0.0",
+            "--snnbp-corr-scale=0.5",
+            "--snnbp-eta=0.35",
+        ],
+    },
+    {
+        "name": "X5_T7_rms",
+        "config": "./cifar10dvs_improved_cgrad.yaml",
+        "flags": [
+            "--du-du=improved_cgrad",
+            "--dS-du=sigmoid",
+            "--snnbp-tau=2.0",
+            "--snnbp-input-scale=coupled",
+            "--detach-reset=True",
+            "--snnbp-norm=rms",
+            "--snnbp-misalign-mode=product",
+            "--snnbp-harmful-only=False",
+            "--snnbp-alpha-mis=15.0",
+            "--snnbp-alpha=4.0",
+            "--snnbp-margin-m=0.25",
+            "--snnbp-epsilon=0.35",
+            "--snnbp-beta=8.0",
+            "--snnbp-intervention=0.25",
+            "--snnbp-gamma-sharp=8.0",
+            "--snnbp-corr-scale=1.0",
+            "--snnbp-eta=1.0",
+        ],
+    },
+    {
+        "name": "X1_T8_sign",
+        "config": "./cifar10dvs_improved_cgrad.yaml",
+        "flags": [
+            "--du-du=improved_cgrad",
+            "--dS-du=sigmoid",
+            "--snnbp-tau=2.0",
+            "--snnbp-input-scale=coupled",
+            "--detach-reset=True",
+            "--snnbp-norm=local",
+            "--snnbp-misalign-mode=sign",
+            "--snnbp-harmful-only=False",
+            "--snnbp-alpha-mis=6.0",
+            "--snnbp-alpha=6.0",
+            "--snnbp-margin-m=0.20",
+            "--snnbp-epsilon=0.35",
+            "--snnbp-beta=8.0",
+            "--snnbp-intervention=0.0",
+            "--snnbp-gamma-sharp=0.0",
+            "--snnbp-corr-scale=0.5",
+            "--snnbp-eta=0.35",
+        ],
+    },
+    {
+        "name": "X2_T7_sign",
+        "config": "./cifar10dvs_improved_cgrad.yaml",
+        "flags": [
+            "--du-du=improved_cgrad",
+            "--dS-du=sigmoid",
+            "--snnbp-tau=2.0",
+            "--snnbp-input-scale=coupled",
+            "--detach-reset=True",
+            "--snnbp-norm=local",
+            "--snnbp-misalign-mode=sign",
+            "--snnbp-harmful-only=False",
+            "--snnbp-alpha-mis=6.0",
+            "--snnbp-alpha=6.0",
+            "--snnbp-margin-m=0.20",
+            "--snnbp-epsilon=0.35",
+            "--snnbp-beta=8.0",
+            "--snnbp-intervention=0.35",
+            "--snnbp-gamma-sharp=8.0",
+            "--snnbp-corr-scale=1.0",
+            "--snnbp-eta=1.0",
+        ],
+    },
+    {
+        "name": "X3_G3_sign",
+        "config": "./cifar10dvs_improved_cgrad.yaml",
+        "flags": [
+            "--du-du=improved_cgrad",
+            "--dS-du=Gamma",
+            "--snnbp-tau=2.0",
+            "--snnbp-input-scale=coupled",
+            "--detach-reset=True",
+            "--snnbp-norm=local",
+            "--snnbp-misalign-mode=sign",
+            "--snnbp-harmful-only=False",
+            "--snnbp-alpha-mis=6.0",
+            "--snnbp-alpha=6.0",
+            "--snnbp-margin-m=0.20",
+            "--snnbp-epsilon=0.35",
+            "--snnbp-beta=8.0",
+            "--snnbp-intervention=0.35",
+            "--snnbp-gamma-sharp=8.0",
+            "--snnbp-corr-scale=1.0",
+            "--snnbp-eta=1.0",
+        ],
+    },
+]
+
+
 def query_gpu_stats():
     for attempt in range(3):
         try:
@@ -402,7 +521,8 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--cgrad-stats-prob", type=float, default=0.02)
     parser.add_argument("--out-dir", default="./logs/tune_phase1")
-    parser.add_argument("--prefix", default="t1_")
+    parser.add_argument("--phase", default="1", choices=["1", "1b"], help="Tuning phase: 1 (12 screen arms) or 1b (5 matched sign/rms arms)")
+    parser.add_argument("--prefix", default="", help="Experiment name prefix (defaults to t1_ for phase 1, t1b_ for phase 1b)")
     parser.add_argument("--arms", default="", help="Optional comma-separated subset of arm names")
     parser.add_argument("--stall-timeout", type=int, default=1200, help="Seconds of epoch progress inactivity before killing stalled run")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
@@ -425,32 +545,45 @@ def main():
     master_log = os.path.join(out_dir, "master.log")
     status_path = os.path.join(out_dir, "status.json")
 
-    selected_arms = [a for a in ARMS if (arm_filter is None or a["name"] in arm_filter)]
+    if not cli.prefix:
+        cli.prefix = "t1b_" if cli.phase == "1b" else "t1_"
+
+    arm_pool = PHASE1B_ARMS if cli.phase == "1b" else ARMS
+    selected_arms = [a for a in arm_pool if (arm_filter is None or a["name"] in arm_filter)]
+    if cli.phase == "1b":
+        # Run slower PyTorch-fallback rms arms first across GPUs, then fast Triton sign arms
+        rms_arms = [a for a in selected_arms if "rms" in a["name"]]
+        non_rms_arms = [a for a in selected_arms if "rms" not in a["name"]]
+        ordered_pairs = [(seed, arm) for seed in seeds for arm in rms_arms] + [
+            (seed, arm) for seed in seeds for arm in non_rms_arms
+        ]
+    else:
+        ordered_pairs = [(seed, arm) for seed in seeds for arm in selected_arms]
+
     tasks = []
     skipped = 0
-    for seed in seeds:
-        for arm in selected_arms:
-            exp_name = f"{cli.prefix}{arm['name']}_seed{seed}"
-            summary_path = os.path.join(summaries_dir, f"{exp_name}.json")
-            existing = load_summary_status(summary_path)
-            if existing and existing.get("status") in ("completed", "nan_collapsed"):
-                skipped += 1
-                continue
-            tasks.append({
-                "arm": arm["name"],
-                "seed": seed,
-                "exp_name": exp_name,
-                "config": arm["config"],
-                "flags": arm["flags"],
-                "summary_path": summary_path,
-                "epochs_jsonl_path": f"{summary_path[:-5]}.epochs.jsonl",
-                "log_path": os.path.join(run_logs_dir, f"{exp_name}.log"),
-                "retries": 0,
-            })
+    for seed, arm in ordered_pairs:
+        exp_name = f"{cli.prefix}{arm['name']}_seed{seed}"
+        summary_path = os.path.join(summaries_dir, f"{exp_name}.json")
+        existing = load_summary_status(summary_path)
+        if existing and existing.get("status") in ("completed", "nan_collapsed"):
+            skipped += 1
+            continue
+        tasks.append({
+            "arm": arm["name"],
+            "seed": seed,
+            "exp_name": exp_name,
+            "config": arm["config"],
+            "flags": arm["flags"],
+            "summary_path": summary_path,
+            "epochs_jsonl_path": f"{summary_path[:-5]}.epochs.jsonl",
+            "log_path": os.path.join(run_logs_dir, f"{exp_name}.log"),
+            "retries": 0,
+        })
 
     if cli.dry_run:
         print(
-            f"Phase 1 tuning dry-run: {len(tasks)} pending tasks ({skipped} already finished), "
+            f"Phase {cli.phase.upper()} tuning dry-run: {len(tasks)} pending tasks ({skipped} already finished), "
             f"candidate_gpus={candidate_gpus}, seeds={seeds}, epochs={cli.epochs}"
         )
         for idx, t in enumerate(tasks, 1):
@@ -459,7 +592,7 @@ def main():
 
     log_msg(
         master_log,
-        f"Phase 1 tuning scheduler starting: {len(tasks)} pending tasks ({skipped} already finished), "
+        f"Phase {cli.phase.upper()} tuning scheduler starting: {len(tasks)} pending tasks ({skipped} already finished), "
         f"candidate_gpus={candidate_gpus}, seeds={seeds}, epochs={cli.epochs}",
     )
 

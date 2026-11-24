@@ -17,6 +17,14 @@ STAGE1_BASELINES = [
     ("B3_impr_twosided_gamma", "Stage 1 default Improved C-Grad (two-sided, Gamma)"),
 ]
 
+PHASE1B_CONTRASTS = [
+    ("X1_T8_sign", "T8_gentle_eta", "Pure sign misalignment vs sharp product [T8 smooth]"),
+    ("X4_T8_rms", "T8_gentle_eta", "Layer RMS norm vs local norm [T8 smooth]"),
+    ("X2_T7_sign", "T7_flip_gated", "Pure sign misalignment vs sharp product [T7 flip gated]"),
+    ("X5_T7_rms", "T7_flip_gated", "Layer RMS norm vs local norm [T7 flip gated]"),
+    ("X3_G3_sign", "G3_gamma_flip_gated", "Pure sign misalignment vs sharp product [G3 Gamma flip]"),
+]
+
 T_CRIT_95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306}
 
 
@@ -149,6 +157,23 @@ def render_report(tune_arms, all_arms):
         s_b0 = f"{r_b0[1]:+.2f} ({r_b0[2]:.2f})" if r_b0 else "N/A"
         s_max = f"{r_bptt[4]:+.2f}" if r_bptt else "N/A"
         lines.append(f"| `{arm}` | {n_p} | {s_bptt} | {s_s1} | {s_b0} | {s_max} |")
+
+    if any(a in tune_arms for a in ("X1_T8_sign", "X2_T7_sign", "X3_G3_sign", "X4_T8_rms", "X5_T7_rms")):
+        lines.append("")
+        lines.append("## Phase 1B Direct Matched Contrasts (`sign` & `rms` vs Phase 1 Winners)")
+        lines.append("")
+        lines.append("| Contrast | Question | n_pairs | Δ mean_last10 (SE) | 95% CI | Δ val/max | eff_rate (LHS vs RHS) |")
+        lines.append("|---|---|---:|---:|---:|---:|---:|")
+        for lhs, rhs, desc in PHASE1B_CONTRASTS:
+            res = paired_delta(all_arms, lhs, rhs)
+            if not res:
+                continue
+            n_p, m_d, se_d, ci, m_dm = res
+            er_l, _ = mean_sd([r.get("cgrad_stats_mean", {}).get("cgrad/effective_rate", 0.0) * 100.0 for r in all_arms[lhs].values() if r.get("status") == "completed"])
+            er_r, _ = mean_sd([r.get("cgrad_stats_mean", {}).get("cgrad/effective_rate", 0.0) * 100.0 for r in all_arms[rhs].values() if r.get("status") == "completed"])
+            lines.append(
+                f"| `{lhs} - {rhs}` | {desc} | {n_p} | {m_d:+.2f} ({se_d:.2f}) | {ci} | {m_dm:+.2f} | {er_l:.2f}% vs {er_r:.2f}% |"
+            )
 
     lines.append("")
     lines.append("## Seed-Level Details (Tuning Runs)")

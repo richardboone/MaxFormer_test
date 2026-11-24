@@ -99,10 +99,11 @@ def classify_arm(stats, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pre-flight gate telemetry probe for Phase 1 tuning arms")
+    parser = argparse.ArgumentParser(description="Pre-flight gate telemetry probe for Phase 1 / Phase 1B tuning arms")
     parser.add_argument("--data-path", default="/data/rboone/datasets/wg_dvst")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--phase", default="1", choices=["1", "1b"], help="Which arm set to probe")
     parser.add_argument("--synthetic", action="store_true")
     cli = parser.parse_args()
 
@@ -125,7 +126,13 @@ def main():
     model.train()
     init_state = copy.deepcopy(model.state_dict())
 
-    all_arms = STAGE1_REFS + [dict(a, is_ref=False) for a in run_tune_phase1.ARMS]
+    if cli.phase == "1b":
+        winner_names = {"T8_gentle_eta", "T7_flip_gated", "G3_gamma_flip_gated"}
+        refs = [dict(a, is_ref=True) for a in run_tune_phase1.ARMS if a["name"] in winner_names]
+        targets = [dict(a, is_ref=False) for a in run_tune_phase1.PHASE1B_ARMS]
+        all_arms = refs + targets
+    else:
+        all_arms = STAGE1_REFS + [dict(a, is_ref=False) for a in run_tune_phase1.ARMS]
 
     header = f"{'arm':24s} | {'surr':7s} | {'eff_rate':>8s} | {'mean_w':>8s} | {'mean_sig':>8s} | {'near%':>6s} | {'m_neg%':>7s} | {'status':10s}"
     print(header)
@@ -165,7 +172,7 @@ def main():
     if bad_arms:
         print(f"\n[PROBE FAIL] {len(bad_arms)} non-reference arms failed calibration: {bad_arms}")
         sys.exit(2)
-    print("\n[PROBE PASS] All 12 Phase 1 tuning arms passed gate calibration.")
+    print(f"\n[PROBE PASS] All {sum(1 for a in all_arms if not a.get('is_ref'))} Phase {cli.phase.upper()} tuning arms passed gate calibration.")
 
 
 if __name__ == "__main__":

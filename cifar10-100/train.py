@@ -364,6 +364,7 @@ parser.add_argument('--snnbp-eta', type=float, default=None, help='correction st
 parser.add_argument('--snnbp-norm', type=str, default=None, choices=['local', 'rms', 'none'], help='improved_cgrad: normalization mode')
 parser.add_argument('--snnbp-harmful-only', type=str2bool, default=None, help='improved_cgrad: gate only on m_eff > 0 instead of |m_eff|')
 parser.add_argument('--snnbp-alpha-mis', type=float, default=None, help='improved_cgrad: misalignment gate steepness')
+parser.add_argument('--snnbp-misalign-mode', type=str, default=None, choices=['product', 'sign'], help='improved_cgrad: misalignment score mode (product vs pure sign)')
 parser.add_argument('--snnbp-margin-m', type=float, default=None, help='improved_cgrad: normalized harmfulness margin')
 parser.add_argument('--snnbp-gamma-sharp', type=float, default=None, help='improved_cgrad: sharpness around threshold h (0 = smooth product)')
 parser.add_argument('--snnbp-corr-scale', type=float, default=None, help='improved_cgrad: relative correction magnitude scale')

@@ -202,6 +202,7 @@ def _lif_improved_cgrad_backward_kernel(
     is_zero_eta: tl.constexpr,    # 1 = pure BPTT (eta == 0.0)
     norm_mode: tl.constexpr,      # 0 = none, 1 = local
     harmful_only: tl.constexpr,   # 0 = two-sided |m_eff|, 1 = harmful m_eff > 0
+    misalign_sign: tl.constexpr,  # 0 = product, 1 = sign
     use_sharp_gate: tl.constexpr, # 1 = thresholded sigmoid, 0 = smooth [0, 1] clamp
     epsilon,
     alpha_m,
@@ -276,6 +277,11 @@ def _lif_improved_cgrad_backward_kernel(
             else:  # none
                 m_eff = m
                 misalignment = -m_grad * base_function
+
+            if misalign_sign == 1:
+                sign_mg = tl.where(m_grad > 0.0, 1.0, tl.where(m_grad < 0.0, -1.0, 0.0))
+                sign_bf = tl.where(base_function > 0.0, 1.0, tl.where(base_function < 0.0, -1.0, 0.0))
+                misalignment = -sign_mg * sign_bf
 
             if harmful_only == 1:
                 m_score = m_eff
@@ -687,6 +693,13 @@ def triton_lif_backward_improved(
         raise ValueError(f"Triton improved_cgrad supports snnbp_norm in ('local', 'none'), got {norm_str!r}")
 
     harmful_only = 1 if bool(_get_arg(args, 'snnbp_harmful_only', True)) else 0
+    misalign_mode = _get_arg(args, 'snnbp_misalign_mode', 'product')
+    if misalign_mode == 'sign':
+        misalign_sign = 1
+    elif misalign_mode == 'product':
+        misalign_sign = 0
+    else:
+        raise ValueError(f"Unsupported snnbp_misalign_mode {misalign_mode!r}; expected 'product' or 'sign'")
     epsilon = float(_get_arg(args, 'snnbp_epsilon', 0.35))
     alpha_m = float(_get_arg(args, 'snnbp_alpha', 3.0))
     beta_d = float(_get_arg(args, 'snnbp_beta', 8.0))
@@ -718,6 +731,7 @@ def triton_lif_backward_improved(
         is_zero_eta=is_zero_eta,
         norm_mode=norm_mode,
         harmful_only=harmful_only,
+        misalign_sign=misalign_sign,
         use_sharp_gate=use_sharp_gate,
         epsilon=epsilon,
         alpha_m=alpha_m,

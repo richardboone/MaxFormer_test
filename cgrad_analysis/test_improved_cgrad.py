@@ -256,6 +256,28 @@ def main():
                                 worst_fp32_rel = max(worst_fp32_rel, rel)
                                 if rel >= 1e-5:
                                     parity_ok = False
+    # snnbp_misalign_mode='sign' Triton vs PyTorch parity check
+    for gsharp in (0.0, 5.0):
+        for harmful in (True, False):
+            args_sign = make_improved_args(
+                dS_du="sigmoid",
+                snnbp_harmful_only=harmful,
+                snnbp_norm="local",
+                snnbp_misalign_mode="sign",
+                snnbp_gamma_sharp=gsharp,
+                snnbp_intervention=0.2 if gsharp > 0 else 0.0,
+            )
+            x_py = x0.clone().requires_grad_(True)
+            x_tr = x0.clone().requires_grad_(True)
+            y_py = event_cn.TimeParallel_LIFSpike.apply(x_py, THRESH, DECAY, ISCALE, GAMA, args_sign, True, "hard")
+            y_tr = event_tn.TritonTimeParallel_LIFSpike.apply(x_tr, THRESH, DECAY, ISCALE, GAMA, args_sign, True, "hard")
+            y_py.backward(w0)
+            y_tr.backward(w0)
+            rel = ((x_py.grad - x_tr.grad).norm() / (x_py.grad.norm() + 1e-12)).item()
+            worst_fp32_rel = max(worst_fp32_rel, rel)
+            if rel >= 1e-5:
+                parity_ok = False
+
     # fp16 parity check
     for sg in ("sigmoid", "Gamma"):
         for harmful in (True, False):

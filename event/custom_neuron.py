@@ -310,6 +310,7 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                         )
                 else:
                     norm_mode = _get_arg(args, 'snnbp_norm', 'local')
+                    misalign_mode = _get_arg(args, 'snnbp_misalign_mode', 'product')
                     harmful_only = bool(_get_arg(args, 'snnbp_harmful_only', True))
                     alpha_m = float(_get_arg(args, 'snnbp_alpha', 3.0))
                     beta_d = float(_get_arg(args, 'snnbp_beta', 8.0))
@@ -337,6 +338,13 @@ class TimeParallel_LIFSpike(torch.autograd.Function):
                     else:
                         raise ValueError(
                             f"Unsupported snnbp_norm {norm_mode!r}; expected 'local', 'rms', or 'none'."
+                        )
+
+                    if misalign_mode == 'sign':
+                        misalignment = -torch.sign(m_grad) * torch.sign(base_function)
+                    elif misalign_mode != 'product':
+                        raise ValueError(
+                            f"Unsupported snnbp_misalign_mode {misalign_mode!r}; expected 'product' or 'sign'."
                         )
 
                     m_score = m_eff if harmful_only else m_eff.abs()

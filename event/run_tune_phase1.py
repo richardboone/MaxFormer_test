@@ -425,39 +425,69 @@ def query_gpu_stats():
     return {}
 
 
-def pick_free_gpu(active_jobs, candidate_gpus):
+def pick_free_gpu(
+    active_jobs,
+    candidate_gpus,
+    jobs_per_gpu=1,
+    max_gpus_override=0,
+    max_mem_per_job_mb=7000,
+):
     stats = query_gpu_stats()
     if not stats:
         return None, 0, 0
-    busy_ours = {job["gpu"] for job in active_jobs}
+    ours_per_gpu = {}
+    for job in active_jobs:
+        g = job["gpu"]
+        ours_per_gpu[g] = ours_per_gpu.get(g, 0) + 1
+    owned_gpus = set(ours_per_gpu.keys())
+
     external_busy = 0
     for idx, (mem_mb, util) in stats.items():
-        if idx in busy_ours:
+        if idx in owned_gpus:
             continue
         if mem_mb >= 1000 or util >= 15:
             external_busy += 1
 
     if external_busy <= 3:
-        max_slots = 4
+        max_gpus = 4
     elif external_busy == 4:
-        max_slots = 3
+        max_gpus = 3
     else:
-        max_slots = 2
+        max_gpus = 2
 
-    max_slots = min(max_slots, len(candidate_gpus))
+    max_gpus = min(max_gpus, len(candidate_gpus))
+    if max_gpus_override > 0:
+        max_gpus = min(max_gpus, max_gpus_override)
+
+    max_slots = max_gpus * jobs_per_gpu
     if len(active_jobs) >= max_slots:
         return None, max_slots, external_busy
 
-    for g in candidate_gpus:
-        if g in busy_ours or g not in stats:
-            continue
-        mem_mb, util = stats[g]
-        if mem_mb < 1000 and util < 10:
-            time.sleep(2.0)
-            stats2 = query_gpu_stats()
-            m2, u2 = stats2.get(g, (99999, 100))
-            if m2 < 1000 and u2 < 10:
+    # Pass 1: spread across distinct free GPUs first up to max_gpus
+    if len(owned_gpus) < max_gpus:
+        for g in candidate_gpus:
+            if g in owned_gpus or g not in stats:
+                continue
+            mem_mb, util = stats[g]
+            if mem_mb < 1000 and util < 10:
+                time.sleep(2.0)
+                stats2 = query_gpu_stats()
+                m2, u2 = stats2.get(g, (99999, 100))
+                if m2 < 1000 and u2 < 10:
+                    return g, max_slots, external_busy
+
+    # Pass 2: pack up to jobs_per_gpu on already-owned GPUs (guarding against external intrusion)
+    if jobs_per_gpu > 1:
+        packable = [
+            g for g in candidate_gpus
+            if g in owned_gpus and g in stats and ours_per_gpu[g] < jobs_per_gpu
+        ]
+        packable.sort(key=lambda g: ours_per_gpu[g])
+        for g in packable:
+            mem_mb, _ = stats[g]
+            if mem_mb < ours_per_gpu[g] * max_mem_per_job_mb + 2000 and (mem_mb + max_mem_per_job_mb) < 75000:
                 return g, max_slots, external_busy
+
     return None, max_slots, external_busy
 
 
@@ -515,10 +545,12 @@ def main():
     parser = argparse.ArgumentParser(description="Phase 1 CIFAR10-DVS Improved C-Grad Tuning Scheduler")
     parser.add_argument("--data-path", default="/data/rboone/datasets/wg_dvst")
     parser.add_argument("--gpus", default="0,1,2,3,4")
+    parser.add_argument("--jobs-per-gpu", type=int, default=1, help="Max concurrent jobs to pack per owned GPU; use 2 on A100-80GB")
+    parser.add_argument("--max-gpus", type=int, default=0, help="Optional hard cap on distinct GPUs used (0 = auto polite 4/3/2)")
     parser.add_argument("--seeds", default="42,43")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=None, help="DataLoader workers per job (default: 4 if jobs-per-gpu==1 else 2)")
     parser.add_argument("--cgrad-stats-prob", type=float, default=0.02)
     parser.add_argument("--out-dir", default="./logs/tune_phase1")
     parser.add_argument("--phase", default="1", choices=["1", "1b"], help="Tuning phase: 1 (12 screen arms) or 1b (5 matched sign/rms arms)")
@@ -544,6 +576,9 @@ def main():
     os.makedirs(summaries_dir, exist_ok=True)
     master_log = os.path.join(out_dir, "master.log")
     status_path = os.path.join(out_dir, "status.json")
+
+    if cli.workers is None:
+        cli.workers = 4 if cli.jobs_per_gpu == 1 else 2
 
     if not cli.prefix:
         cli.prefix = "t1b_" if cli.phase == "1b" else "t1_"
@@ -584,7 +619,8 @@ def main():
     if cli.dry_run:
         print(
             f"Phase {cli.phase.upper()} tuning dry-run: {len(tasks)} pending tasks ({skipped} already finished), "
-            f"candidate_gpus={candidate_gpus}, seeds={seeds}, epochs={cli.epochs}"
+            f"candidate_gpus={candidate_gpus}, jobs_per_gpu={cli.jobs_per_gpu}, max_gpus={cli.max_gpus or 'auto'}, "
+            f"workers={cli.workers}, seeds={seeds}, epochs={cli.epochs}"
         )
         for idx, t in enumerate(tasks, 1):
             print(f"{idx:2d}. {t['exp_name']} | config={t['config']} | {' '.join(t['flags'])}")
@@ -593,7 +629,8 @@ def main():
     log_msg(
         master_log,
         f"Phase {cli.phase.upper()} tuning scheduler starting: {len(tasks)} pending tasks ({skipped} already finished), "
-        f"candidate_gpus={candidate_gpus}, seeds={seeds}, epochs={cli.epochs}",
+        f"candidate_gpus={candidate_gpus}, jobs_per_gpu={cli.jobs_per_gpu}, max_gpus={cli.max_gpus or 'auto'}, "
+        f"workers={cli.workers}, seeds={seeds}, epochs={cli.epochs}",
     )
 
     active_jobs = []
@@ -699,7 +736,12 @@ def main():
                 skipped += 1
                 log_msg(master_log, f"SKIP  {next_task['exp_name']} (prior 2 seeds collapsed)")
                 continue
-            gpu_id, max_slots, ext_busy = pick_free_gpu(active_jobs, candidate_gpus)
+            gpu_id, max_slots, ext_busy = pick_free_gpu(
+                active_jobs,
+                candidate_gpus,
+                jobs_per_gpu=cli.jobs_per_gpu,
+                max_gpus_override=cli.max_gpus,
+            )
             if gpu_id is None:
                 break
             t = tasks.pop(0)

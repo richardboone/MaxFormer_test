@@ -484,6 +484,44 @@ PHASE2_ARMS = [
 ]
 
 
+_ARMS_BY_NAME = {a["name"]: a for a in ARMS + PHASE1B_ARMS + PHASE2_ARMS}
+
+PHASE3_ARMS = [
+    dict(_ARMS_BY_NAME["P2_T8_eta055"], default_seeds=[44, 45, 46]),
+    dict(_ARMS_BY_NAME["T8_gentle_eta"], default_seeds=[44, 45, 46]),
+    dict(_ARMS_BY_NAME["T7_flip_gated"], default_seeds=[44, 45, 46]),
+    dict(_ARMS_BY_NAME["G3_gamma_flip_gated"], default_seeds=[44, 45, 46]),
+    {
+        "name": "A0_bptt_sig",
+        "config": "./cifar10dvs_improved_cgrad.yaml",
+        "flags": [
+            "--du-du=improved_cgrad",
+            "--dS-du=sigmoid",
+            "--snnbp-tau=2.0",
+            "--snnbp-input-scale=coupled",
+            "--detach-reset=True",
+            "--snnbp-norm=local",
+            "--snnbp-eta=0.0",
+        ],
+        "default_seeds": [45, 46],
+    },
+    {
+        "name": "B0_bptt_gamma",
+        "config": "./cifar10dvs_improved_cgrad.yaml",
+        "flags": [
+            "--du-du=improved_cgrad",
+            "--dS-du=Gamma",
+            "--snnbp-tau=2.0",
+            "--snnbp-input-scale=coupled",
+            "--detach-reset=True",
+            "--snnbp-norm=local",
+            "--snnbp-eta=0.0",
+        ],
+        "default_seeds": [45, 46],
+    },
+]
+
+
 def query_gpu_stats():
     for attempt in range(3):
         try:
@@ -633,14 +671,23 @@ def main():
     parser.add_argument("--gpus", default="0,1,2,3,4")
     parser.add_argument("--jobs-per-gpu", type=int, default=1, help="Max concurrent jobs to pack per owned GPU; use 2 on A100-80GB")
     parser.add_argument("--max-gpus", type=int, default=0, help="Optional hard cap on distinct GPUs used (0 = auto polite 4/3/2)")
-    parser.add_argument("--seeds", default="42,43")
+    parser.add_argument(
+        "--seeds",
+        default="",
+        help="Comma-separated seeds (default: 42,43 for phases 1/1b/2; per-arm held-out seeds {44,45,46}/{45,46} for phase 3)",
+    )
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=None, help="DataLoader workers per job (default: 4 if jobs-per-gpu==1 else 2)")
     parser.add_argument("--cgrad-stats-prob", type=float, default=0.02)
     parser.add_argument("--out-dir", default="./logs/tune_phase1")
-    parser.add_argument("--phase", default="1", choices=["1", "1b", "2"], help="Tuning phase: 1 (12 screen arms), 1b (5 matched sign/rms arms), or 2 (6 local refinement arms)")
-    parser.add_argument("--prefix", default="", help="Experiment name prefix (defaults to t1_ for phase 1, t1b_ for phase 1b)")
+    parser.add_argument(
+        "--phase",
+        default="1",
+        choices=["1", "1b", "2", "3"],
+        help="Tuning phase: 1 (12 screen arms), 1b (5 matched sign/rms arms), 2 (6 local refinement arms), or 3 (held-out 5-seed confirmation)",
+    )
+    parser.add_argument("--prefix", default="", help="Experiment name prefix (defaults to t1_/t1b_/t2_/t3_)")
     parser.add_argument("--arms", default="", help="Optional comma-separated subset of arm names")
     parser.add_argument("--stall-timeout", type=int, default=1200, help="Seconds of epoch progress inactivity before killing stalled run")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
@@ -652,7 +699,6 @@ def main():
     os.chdir(event_dir)
 
     candidate_gpus = [int(x) for x in cli.gpus.split(",") if x.strip()]
-    seeds = [int(x) for x in cli.seeds.split(",") if x.strip()]
     arm_filter = {x.strip() for x in cli.arms.split(",") if x.strip()} if cli.arms else None
 
     out_dir = os.path.abspath(cli.out_dir)
@@ -667,19 +713,39 @@ def main():
         cli.workers = 4 if cli.jobs_per_gpu == 1 else 2
 
     if not cli.prefix:
-        cli.prefix = {"1": "t1_", "1b": "t1b_", "2": "t2_"}[cli.phase]
+        cli.prefix = {"1": "t1_", "1b": "t1b_", "2": "t2_", "3": "t3_"}[cli.phase]
 
-    arm_pool = {"1": ARMS, "1b": PHASE1B_ARMS, "2": PHASE2_ARMS}[cli.phase]
+    arm_pool = {"1": ARMS, "1b": PHASE1B_ARMS, "2": PHASE2_ARMS, "3": PHASE3_ARMS}[cli.phase]
     selected_arms = [a for a in arm_pool if (arm_filter is None or a["name"] in arm_filter)]
-    if cli.phase == "1b":
-        # Run slower PyTorch-fallback rms arms first across GPUs, then fast Triton sign arms
-        rms_arms = [a for a in selected_arms if "rms" in a["name"]]
-        non_rms_arms = [a for a in selected_arms if "rms" not in a["name"]]
-        ordered_pairs = [(seed, arm) for seed in seeds for arm in rms_arms] + [
-            (seed, arm) for seed in seeds for arm in non_rms_arms
+    if cli.seeds.strip():
+        seeds = [int(x) for x in cli.seeds.split(",") if x.strip()]
+        if cli.phase == "1b":
+            # Run slower PyTorch-fallback rms arms first across GPUs, then fast Triton sign arms
+            rms_arms = [a for a in selected_arms if "rms" in a["name"]]
+            non_rms_arms = [a for a in selected_arms if "rms" not in a["name"]]
+            ordered_pairs = [(seed, arm) for seed in seeds for arm in rms_arms] + [
+                (seed, arm) for seed in seeds for arm in non_rms_arms
+            ]
+        else:
+            ordered_pairs = [(seed, arm) for seed in seeds for arm in selected_arms]
+    elif cli.phase == "3":
+        seeds = sorted({s for a in selected_arms for s in a["default_seeds"]})
+        ordered_pairs = [
+            (seed, arm)
+            for seed in seeds
+            for arm in selected_arms
+            if seed in arm["default_seeds"]
         ]
     else:
-        ordered_pairs = [(seed, arm) for seed in seeds for arm in selected_arms]
+        seeds = [42, 43]
+        if cli.phase == "1b":
+            rms_arms = [a for a in selected_arms if "rms" in a["name"]]
+            non_rms_arms = [a for a in selected_arms if "rms" not in a["name"]]
+            ordered_pairs = [(seed, arm) for seed in seeds for arm in rms_arms] + [
+                (seed, arm) for seed in seeds for arm in non_rms_arms
+            ]
+        else:
+            ordered_pairs = [(seed, arm) for seed in seeds for arm in selected_arms]
 
     tasks = []
     skipped = 0

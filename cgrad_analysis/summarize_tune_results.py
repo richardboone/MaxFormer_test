@@ -35,6 +35,20 @@ PHASE2_CONTRASTS = [
     ("P2_T7_strict_h45", "T7_flip_gated", "Stricter gate h=0.45,g=10 vs h=0.35,g=8 [T7 flip]"),
 ]
 
+BASELINE_NAMES = {name for name, _ in STAGE1_BASELINES}
+
+PHASE3_FINALISTS = ["P2_T8_eta055", "T8_gentle_eta", "T7_flip_gated", "G3_gamma_flip_gated"]
+PHASE3_HELDOUT_SEEDS = {44, 45, 46}
+PHASE3_ALL_SEEDS = {42, 43, 44, 45, 46}
+
+PHASE3_DIRECT_CONTRASTS = [
+    ("P2_T8_eta055", "T8_gentle_eta", "eta=0.55 vs eta=0.35 [smooth sigmoid]"),
+    ("P2_T8_eta055", "T7_flip_gated", "Smooth eta=0.55 vs Gated flip T7 [sigmoid]"),
+    ("T8_gentle_eta", "T7_flip_gated", "Smooth eta=0.35 vs Gated flip T7 [sigmoid]"),
+    ("G3_gamma_flip_gated", "B0_bptt_gamma", "Gated flip vs Gamma BPTT [Gamma]"),
+    ("P2_T8_eta055", "B0_bptt_gamma", "Top smooth sigmoid vs Gamma BPTT"),
+]
+
 T_CRIT_95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306}
 
 
@@ -86,10 +100,12 @@ def load_tune_dir(tune_dir):
     return by_arm
 
 
-def paired_delta(by_arm, lhs, rhs):
+def paired_delta(by_arm, lhs, rhs, seed_subset=None):
     if lhs not in by_arm or rhs not in by_arm:
         return None
     common = sorted(set(by_arm[lhs]).intersection(by_arm[rhs]))
+    if seed_subset is not None:
+        common = [s for s in common if s in seed_subset]
     d_last = []
     d_max = []
     for s in common:
@@ -102,12 +118,72 @@ def paired_delta(by_arm, lhs, rhs):
     m_d, sd_d = mean_sd(d_last)
     se_d = sd_d / math.sqrt(len(d_last))
     m_dm, _ = mean_sd(d_max)
+    wins = sum(1 for d in d_last if d > 0.0)
     if len(d_last) >= 2:
         tcrit = T_CRIT_95.get(len(d_last) - 1, 1.96)
         ci = f"[{m_d - tcrit * se_d:+.2f}, {m_d + tcrit * se_d:+.2f}]"
     else:
         ci = "N/A"
-    return len(d_last), m_d, se_d, ci, m_dm
+    return len(d_last), m_d, se_d, ci, m_dm, wins
+
+
+def _render_contrast_section(lines, title, contrasts, all_arms, seed_subset=None):
+    rows = []
+    for lhs, rhs, desc in contrasts:
+        res = paired_delta(all_arms, lhs, rhs, seed_subset=seed_subset)
+        if not res:
+            continue
+        n_p, m_d, se_d, ci, m_dm, wins = res
+        er_l, _ = mean_sd([
+            r.get("cgrad_stats_mean", {}).get("cgrad/effective_rate", 0.0) * 100.0
+            for s, r in all_arms[lhs].items()
+            if r.get("status") == "completed" and (seed_subset is None or s in seed_subset)
+        ])
+        er_r, _ = mean_sd([
+            r.get("cgrad_stats_mean", {}).get("cgrad/effective_rate", 0.0) * 100.0
+            for s, r in all_arms[rhs].items()
+            if r.get("status") == "completed" and (seed_subset is None or s in seed_subset)
+        ])
+        rows.append(
+            f"| `{lhs} - {rhs}` | {desc} | {n_p} | {m_d:+.2f} ({se_d:.2f}) | {ci} | {m_dm:+.2f} | {wins}/{n_p} | {er_l:.2f}% vs {er_r:.2f}% |"
+        )
+    if not rows:
+        return
+    lines.append("")
+    lines.append(title)
+    lines.append("")
+    lines.append("| Contrast | Question | n_pairs | Δ mean_last10 (SE) | 95% CI | Δ val/max | wins | eff_rate (LHS vs RHS) |")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+    lines.extend(rows)
+
+
+def _render_confirmation_table(lines, title, all_arms, seed_subset):
+    lines.append("")
+    lines.append(title)
+    lines.append("")
+    lines.append("| Arm | Surr | n | val/mean_last10 | val/max | Δ vs Matched BPTT | Δ vs `B0_bptt_gamma` | wins vs BPTT |")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|")
+    for arm in ["A0_bptt_sig", "B0_bptt_gamma"] + PHASE3_FINALISTS:
+        smap = all_arms.get(arm, {})
+        ok_recs = [r for s, r in sorted(smap.items()) if s in seed_subset and r.get("status") == "completed"]
+        if not ok_recs:
+            continue
+        surr = ok_recs[0].get("args", {}).get("dS_du", "?")
+        m_last, sd_last = mean_sd([r["val_mean_last_k"] for r in ok_recs])
+        m_max, sd_max = mean_sd([r["max_val_acc1"] for r in ok_recs])
+        if arm in PHASE3_FINALISTS:
+            bptt_ref = "B0_bptt_gamma" if surr == "Gamma" else "A0_bptt_sig"
+            r_bptt = paired_delta(all_arms, arm, bptt_ref, seed_subset=seed_subset)
+            r_b0 = paired_delta(all_arms, arm, "B0_bptt_gamma", seed_subset=seed_subset)
+            s_bptt = f"{r_bptt[1]:+.2f} ({r_bptt[2]:.2f}) {r_bptt[3]}" if r_bptt else "N/A"
+            s_b0 = f"{r_b0[1]:+.2f} ({r_b0[2]:.2f}) {r_b0[3]}" if r_b0 else "N/A"
+            s_wins = f"{r_bptt[5]}/{r_bptt[0]}" if r_bptt else "N/A"
+        else:
+            s_bptt, s_b0, s_wins = "-", "-", "-"
+        lines.append(
+            f"| `{arm}` | {surr} | {len(ok_recs)} | {m_last:.2f} ± {sd_last:.2f} | "
+            f"{m_max:.2f} ± {sd_max:.2f} | {s_bptt} | {s_b0} | {s_wins} |"
+        )
 
 
 def render_report(tune_arms, all_arms):
@@ -117,9 +193,15 @@ def render_report(tune_arms, all_arms):
 
     ordered = sorted(all_arms.keys(), key=rank_key)
 
+    has_p3 = any(
+        any(s in PHASE3_HELDOUT_SEEDS and r.get("status") == "completed" for s, r in all_arms.get(a, {}).items())
+        for a in PHASE3_FINALISTS
+    )
     has_p2 = any(a.startswith("P2_") for a in tune_arms)
     has_p1b = any(a in tune_arms for a in ("X1_T8_sign", "X2_T7_sign", "X3_G3_sign", "X4_T8_rms", "X5_T7_rms"))
-    if has_p2:
+    if has_p3:
+        title = "# Improved C-Grad Phase 3 Held-Out 5-Seed Confirmation (CIFAR10-DVS MaxFormer)"
+    elif has_p2:
         title = "# Improved C-Grad Phase 1 + 1B + 2 Tuning Results (CIFAR10-DVS MaxFormer)"
     elif has_p1b:
         title = "# Improved C-Grad Phase 1 + 1B Tuning Results (CIFAR10-DVS MaxFormer)"
@@ -128,6 +210,26 @@ def render_report(tune_arms, all_arms):
 
     lines = []
     lines.append(title)
+    if has_p3:
+        _render_confirmation_table(
+            lines,
+            "## Phase 3 Held-Out 3-Seed Confirmation (Unseen Seeds {44, 45, 46})",
+            all_arms,
+            PHASE3_HELDOUT_SEEDS,
+        )
+        _render_confirmation_table(
+            lines,
+            "## Phase 3 Full 5-Seed Confirmation (All Paired Seeds {42, 43, 44, 45, 46})",
+            all_arms,
+            PHASE3_ALL_SEEDS,
+        )
+        _render_contrast_section(
+            lines,
+            "## Phase 3 Direct Finalist Contrasts (Full 5-Seed Paired {42..46})",
+            PHASE3_DIRECT_CONTRASTS,
+            all_arms,
+            seed_subset=PHASE3_ALL_SEEDS,
+        )
     lines.append("")
     lines.append("## Per-Arm Summary (Ranked by `val/mean_last10`)")
     lines.append("")
@@ -178,38 +280,20 @@ def render_report(tune_arms, all_arms):
         lines.append(f"| `{arm}` | {n_p} | {s_bptt} | {s_s1} | {s_b0} | {s_max} |")
 
     if has_p1b:
-        lines.append("")
-        lines.append("## Phase 1B Direct Matched Contrasts (`sign` & `rms` vs Phase 1 Winners)")
-        lines.append("")
-        lines.append("| Contrast | Question | n_pairs | Δ mean_last10 (SE) | 95% CI | Δ val/max | eff_rate (LHS vs RHS) |")
-        lines.append("|---|---|---:|---:|---:|---:|---:|")
-        for lhs, rhs, desc in PHASE1B_CONTRASTS:
-            res = paired_delta(all_arms, lhs, rhs)
-            if not res:
-                continue
-            n_p, m_d, se_d, ci, m_dm = res
-            er_l, _ = mean_sd([r.get("cgrad_stats_mean", {}).get("cgrad/effective_rate", 0.0) * 100.0 for r in all_arms[lhs].values() if r.get("status") == "completed"])
-            er_r, _ = mean_sd([r.get("cgrad_stats_mean", {}).get("cgrad/effective_rate", 0.0) * 100.0 for r in all_arms[rhs].values() if r.get("status") == "completed"])
-            lines.append(
-                f"| `{lhs} - {rhs}` | {desc} | {n_p} | {m_d:+.2f} ({se_d:.2f}) | {ci} | {m_dm:+.2f} | {er_l:.2f}% vs {er_r:.2f}% |"
-            )
+        _render_contrast_section(
+            lines,
+            "## Phase 1B Direct Matched Contrasts (`sign` & `rms` vs Phase 1 Winners)",
+            PHASE1B_CONTRASTS,
+            all_arms,
+        )
 
     if has_p2:
-        lines.append("")
-        lines.append("## Phase 2 Local Refinement Contrasts (vs Phase 1 Winners)")
-        lines.append("")
-        lines.append("| Contrast | Question | n_pairs | Δ mean_last10 (SE) | 95% CI | Δ val/max | eff_rate (LHS vs RHS) |")
-        lines.append("|---|---|---:|---:|---:|---:|---:|")
-        for lhs, rhs, desc in PHASE2_CONTRASTS:
-            res = paired_delta(all_arms, lhs, rhs)
-            if not res:
-                continue
-            n_p, m_d, se_d, ci, m_dm = res
-            er_l, _ = mean_sd([r.get("cgrad_stats_mean", {}).get("cgrad/effective_rate", 0.0) * 100.0 for r in all_arms[lhs].values() if r.get("status") == "completed"])
-            er_r, _ = mean_sd([r.get("cgrad_stats_mean", {}).get("cgrad/effective_rate", 0.0) * 100.0 for r in all_arms[rhs].values() if r.get("status") == "completed"])
-            lines.append(
-                f"| `{lhs} - {rhs}` | {desc} | {n_p} | {m_d:+.2f} ({se_d:.2f}) | {ci} | {m_dm:+.2f} | {er_l:.2f}% vs {er_r:.2f}% |"
-            )
+        _render_contrast_section(
+            lines,
+            "## Phase 2 Local Refinement Contrasts (vs Phase 1 Winners)",
+            PHASE2_CONTRASTS,
+            all_arms,
+        )
 
     lines.append("")
     lines.append("## Seed-Level Details (Tuning Runs)")
@@ -243,11 +327,16 @@ def main():
         print(f"No tuning JSON summaries found in {args.tune_dir}")
         return
 
-    all_arms = {}
-    all_arms.update(stage1_arms)
-    all_arms.update(tune_arms)
+    all_arms = defaultdict(dict)
+    for arm, smap in stage1_arms.items():
+        all_arms[arm].update(smap)
+    filtered_tune_arms = defaultdict(dict)
+    for arm, smap in tune_arms.items():
+        all_arms[arm].update(smap)
+        if arm not in BASELINE_NAMES:
+            filtered_tune_arms[arm].update(smap)
 
-    report = render_report(tune_arms, all_arms)
+    report = render_report(filtered_tune_arms, all_arms)
     print(report)
     if args.write_md:
         parent = os.path.dirname(os.path.abspath(args.write_md))

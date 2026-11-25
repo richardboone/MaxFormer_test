@@ -398,6 +398,92 @@ PHASE1B_ARMS = [
 ]
 
 
+_PHASE2_SHARED_FLAGS = [
+    "--du-du=improved_cgrad",
+    "--snnbp-tau=2.0",
+    "--snnbp-input-scale=coupled",
+    "--detach-reset=True",
+    "--snnbp-norm=local",
+    "--snnbp-misalign-mode=product",
+    "--snnbp-harmful-only=False",
+    "--snnbp-alpha-mis=25.0",
+    "--snnbp-alpha=6.0",
+    "--snnbp-margin-m=0.20",
+    "--snnbp-epsilon=0.35",
+    "--snnbp-beta=8.0",
+]
+
+PHASE2_ARMS = [
+    {
+        "name": name,
+        "config": "./cifar10dvs_improved_cgrad.yaml",
+        "flags": list(_PHASE2_SHARED_FLAGS) + extra_flags,
+    }
+    for name, extra_flags in [
+        (
+            "P2_T8_eta020",
+            [
+                "--dS-du=sigmoid",
+                "--snnbp-intervention=0.0",
+                "--snnbp-gamma-sharp=0.0",
+                "--snnbp-corr-scale=0.5",
+                "--snnbp-eta=0.20",
+            ],
+        ),
+        (
+            "P2_T8_eta055",
+            [
+                "--dS-du=sigmoid",
+                "--snnbp-intervention=0.0",
+                "--snnbp-gamma-sharp=0.0",
+                "--snnbp-corr-scale=0.5",
+                "--snnbp-eta=0.55",
+            ],
+        ),
+        (
+            "P2_T8_flip",
+            [
+                "--dS-du=sigmoid",
+                "--snnbp-intervention=0.0",
+                "--snnbp-gamma-sharp=0.0",
+                "--snnbp-corr-scale=1.0",
+                "--snnbp-eta=0.35",
+            ],
+        ),
+        (
+            "P2_G5_gamma_gentle",
+            [
+                "--dS-du=Gamma",
+                "--snnbp-intervention=0.0",
+                "--snnbp-gamma-sharp=0.0",
+                "--snnbp-corr-scale=0.5",
+                "--snnbp-eta=0.35",
+            ],
+        ),
+        (
+            "P2_T7_eta060",
+            [
+                "--dS-du=sigmoid",
+                "--snnbp-intervention=0.35",
+                "--snnbp-gamma-sharp=8.0",
+                "--snnbp-corr-scale=1.0",
+                "--snnbp-eta=0.60",
+            ],
+        ),
+        (
+            "P2_T7_strict_h45",
+            [
+                "--dS-du=sigmoid",
+                "--snnbp-intervention=0.45",
+                "--snnbp-gamma-sharp=10.0",
+                "--snnbp-corr-scale=1.0",
+                "--snnbp-eta=1.0",
+            ],
+        ),
+    ]
+]
+
+
 def query_gpu_stats():
     for attempt in range(3):
         try:
@@ -553,7 +639,7 @@ def main():
     parser.add_argument("--workers", type=int, default=None, help="DataLoader workers per job (default: 4 if jobs-per-gpu==1 else 2)")
     parser.add_argument("--cgrad-stats-prob", type=float, default=0.02)
     parser.add_argument("--out-dir", default="./logs/tune_phase1")
-    parser.add_argument("--phase", default="1", choices=["1", "1b"], help="Tuning phase: 1 (12 screen arms) or 1b (5 matched sign/rms arms)")
+    parser.add_argument("--phase", default="1", choices=["1", "1b", "2"], help="Tuning phase: 1 (12 screen arms), 1b (5 matched sign/rms arms), or 2 (6 local refinement arms)")
     parser.add_argument("--prefix", default="", help="Experiment name prefix (defaults to t1_ for phase 1, t1b_ for phase 1b)")
     parser.add_argument("--arms", default="", help="Optional comma-separated subset of arm names")
     parser.add_argument("--stall-timeout", type=int, default=1200, help="Seconds of epoch progress inactivity before killing stalled run")
@@ -581,9 +667,9 @@ def main():
         cli.workers = 4 if cli.jobs_per_gpu == 1 else 2
 
     if not cli.prefix:
-        cli.prefix = "t1b_" if cli.phase == "1b" else "t1_"
+        cli.prefix = {"1": "t1_", "1b": "t1b_", "2": "t2_"}[cli.phase]
 
-    arm_pool = PHASE1B_ARMS if cli.phase == "1b" else ARMS
+    arm_pool = {"1": ARMS, "1b": PHASE1B_ARMS, "2": PHASE2_ARMS}[cli.phase]
     selected_arms = [a for a in arm_pool if (arm_filter is None or a["name"] in arm_filter)]
     if cli.phase == "1b":
         # Run slower PyTorch-fallback rms arms first across GPUs, then fast Triton sign arms

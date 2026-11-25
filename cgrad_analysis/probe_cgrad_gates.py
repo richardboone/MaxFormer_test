@@ -103,7 +103,7 @@ def main():
     parser.add_argument("--data-path", default="/data/rboone/datasets/wg_dvst")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--phase", default="1", choices=["1", "1b"], help="Which arm set to probe")
+    parser.add_argument("--phase", default="1", choices=["1", "1b", "2"], help="Which arm set to probe")
     parser.add_argument("--synthetic", action="store_true")
     cli = parser.parse_args()
 
@@ -126,10 +126,11 @@ def main():
     model.train()
     init_state = copy.deepcopy(model.state_dict())
 
-    if cli.phase == "1b":
+    if cli.phase in ("1b", "2"):
         winner_names = {"T8_gentle_eta", "T7_flip_gated", "G3_gamma_flip_gated"}
         refs = [dict(a, is_ref=True) for a in run_tune_phase1.ARMS if a["name"] in winner_names]
-        targets = [dict(a, is_ref=False) for a in run_tune_phase1.PHASE1B_ARMS]
+        raw_targets = run_tune_phase1.PHASE1B_ARMS if cli.phase == "1b" else run_tune_phase1.PHASE2_ARMS
+        targets = [dict(a, is_ref=False) for a in raw_targets]
         all_arms = refs + targets
     else:
         all_arms = STAGE1_REFS + [dict(a, is_ref=False) for a in run_tune_phase1.ARMS]

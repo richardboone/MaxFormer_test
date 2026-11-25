@@ -25,6 +25,16 @@ PHASE1B_CONTRASTS = [
     ("X3_G3_sign", "G3_gamma_flip_gated", "Pure sign misalignment vs sharp product [G3 Gamma flip]"),
 ]
 
+PHASE2_CONTRASTS = [
+    ("P2_T8_eta020", "T8_gentle_eta", "Gentler eta=0.20 vs 0.35 [T8 smooth]"),
+    ("P2_T8_eta055", "T8_gentle_eta", "Stronger eta=0.55 vs 0.35 [T8 smooth]"),
+    ("P2_T8_flip", "T8_gentle_eta", "Full flip corr_scale=1.0 vs 0.5 [T8 smooth]"),
+    ("P2_G5_gamma_gentle", "G3_gamma_flip_gated", "Smooth gentle eta=0.35 vs gated flip [Gamma]"),
+    ("P2_G5_gamma_gentle", "B0_bptt_gamma", "Gamma smooth gentle eta=0.35 vs Gamma BPTT"),
+    ("P2_T7_eta060", "T7_flip_gated", "Gentler eta=0.60 vs 1.0 [T7 flip gated]"),
+    ("P2_T7_strict_h45", "T7_flip_gated", "Stricter gate h=0.45,g=10 vs h=0.35,g=8 [T7 flip]"),
+]
+
 T_CRIT_95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306}
 
 
@@ -40,7 +50,7 @@ def mean_sd(vals):
 
 
 def parse_arm_from_exp(exp_name):
-    for prefix in ("s1_", "t1b_", "t1_"):
+    for prefix in ("s1_", "t1b_", "t1_", "t2_", "t3_"):
         if exp_name.startswith(prefix):
             body = exp_name[len(prefix):]
             if "_seed" in body:
@@ -107,8 +117,17 @@ def render_report(tune_arms, all_arms):
 
     ordered = sorted(all_arms.keys(), key=rank_key)
 
+    has_p2 = any(a.startswith("P2_") for a in tune_arms)
+    has_p1b = any(a in tune_arms for a in ("X1_T8_sign", "X2_T7_sign", "X3_G3_sign", "X4_T8_rms", "X5_T7_rms"))
+    if has_p2:
+        title = "# Improved C-Grad Phase 1 + 1B + 2 Tuning Results (CIFAR10-DVS MaxFormer)"
+    elif has_p1b:
+        title = "# Improved C-Grad Phase 1 + 1B Tuning Results (CIFAR10-DVS MaxFormer)"
+    else:
+        title = "# Improved C-Grad Phase 1 Tuning Results (CIFAR10-DVS MaxFormer)"
+
     lines = []
-    lines.append("# Improved C-Grad Phase 1 Tuning Results (CIFAR10-DVS MaxFormer)")
+    lines.append(title)
     lines.append("")
     lines.append("## Per-Arm Summary (Ranked by `val/mean_last10`)")
     lines.append("")
@@ -158,13 +177,30 @@ def render_report(tune_arms, all_arms):
         s_max = f"{r_bptt[4]:+.2f}" if r_bptt else "N/A"
         lines.append(f"| `{arm}` | {n_p} | {s_bptt} | {s_s1} | {s_b0} | {s_max} |")
 
-    if any(a in tune_arms for a in ("X1_T8_sign", "X2_T7_sign", "X3_G3_sign", "X4_T8_rms", "X5_T7_rms")):
+    if has_p1b:
         lines.append("")
         lines.append("## Phase 1B Direct Matched Contrasts (`sign` & `rms` vs Phase 1 Winners)")
         lines.append("")
         lines.append("| Contrast | Question | n_pairs | Δ mean_last10 (SE) | 95% CI | Δ val/max | eff_rate (LHS vs RHS) |")
         lines.append("|---|---|---:|---:|---:|---:|---:|")
         for lhs, rhs, desc in PHASE1B_CONTRASTS:
+            res = paired_delta(all_arms, lhs, rhs)
+            if not res:
+                continue
+            n_p, m_d, se_d, ci, m_dm = res
+            er_l, _ = mean_sd([r.get("cgrad_stats_mean", {}).get("cgrad/effective_rate", 0.0) * 100.0 for r in all_arms[lhs].values() if r.get("status") == "completed"])
+            er_r, _ = mean_sd([r.get("cgrad_stats_mean", {}).get("cgrad/effective_rate", 0.0) * 100.0 for r in all_arms[rhs].values() if r.get("status") == "completed"])
+            lines.append(
+                f"| `{lhs} - {rhs}` | {desc} | {n_p} | {m_d:+.2f} ({se_d:.2f}) | {ci} | {m_dm:+.2f} | {er_l:.2f}% vs {er_r:.2f}% |"
+            )
+
+    if has_p2:
+        lines.append("")
+        lines.append("## Phase 2 Local Refinement Contrasts (vs Phase 1 Winners)")
+        lines.append("")
+        lines.append("| Contrast | Question | n_pairs | Δ mean_last10 (SE) | 95% CI | Δ val/max | eff_rate (LHS vs RHS) |")
+        lines.append("|---|---|---:|---:|---:|---:|---:|")
+        for lhs, rhs, desc in PHASE2_CONTRASTS:
             res = paired_delta(all_arms, lhs, rhs)
             if not res:
                 continue

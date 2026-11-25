@@ -555,6 +555,7 @@ def pick_free_gpu(
     jobs_per_gpu=1,
     max_gpus_override=0,
     max_mem_per_job_mb=7000,
+    ignore_polite_cap=False,
 ):
     stats = query_gpu_stats()
     if not stats:
@@ -572,7 +573,9 @@ def pick_free_gpu(
         if mem_mb >= 1000 or util >= 15:
             external_busy += 1
 
-    if external_busy <= 3:
+    if ignore_polite_cap:
+        max_gpus = len(candidate_gpus)
+    elif external_busy <= 3:
         max_gpus = 4
     elif external_busy == 4:
         max_gpus = 3
@@ -689,6 +692,8 @@ def main():
     )
     parser.add_argument("--prefix", default="", help="Experiment name prefix (defaults to t1_/t1b_/t2_/t3_)")
     parser.add_argument("--arms", default="", help="Optional comma-separated subset of arm names")
+    parser.add_argument("--skip-exps", default="", help="Optional comma-separated experiment names to skip")
+    parser.add_argument("--ignore-polite-cap", action="store_true", help="Allow using all idle candidate GPUs regardless of external load")
     parser.add_argument("--stall-timeout", type=int, default=1200, help="Seconds of epoch progress inactivity before killing stalled run")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb-online", action="store_true", help="Run wandb online instead of offline mode")
@@ -700,6 +705,7 @@ def main():
 
     candidate_gpus = [int(x) for x in cli.gpus.split(",") if x.strip()]
     arm_filter = {x.strip() for x in cli.arms.split(",") if x.strip()} if cli.arms else None
+    skip_exps = {x.strip() for x in cli.skip_exps.split(",") if x.strip()} if cli.skip_exps else set()
 
     out_dir = os.path.abspath(cli.out_dir)
     run_logs_dir = os.path.join(out_dir, "run_logs")
@@ -751,6 +757,9 @@ def main():
     skipped = 0
     for seed, arm in ordered_pairs:
         exp_name = f"{cli.prefix}{arm['name']}_seed{seed}"
+        if exp_name in skip_exps:
+            skipped += 1
+            continue
         summary_path = os.path.join(summaries_dir, f"{exp_name}.json")
         existing = load_summary_status(summary_path)
         if existing and existing.get("status") in ("completed", "nan_collapsed"):
@@ -893,6 +902,7 @@ def main():
                 candidate_gpus,
                 jobs_per_gpu=cli.jobs_per_gpu,
                 max_gpus_override=cli.max_gpus,
+                ignore_polite_cap=cli.ignore_polite_cap,
             )
             if gpu_id is None:
                 break

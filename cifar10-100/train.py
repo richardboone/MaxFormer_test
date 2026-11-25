@@ -17,6 +17,8 @@ Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
 import argparse
 import json
+import math
+import signal
 import time
 import yaml
 import os
@@ -409,6 +411,10 @@ def _parse_args():
 max_accuracy = 0.0
 
 
+class _NaNCollapseError(RuntimeError):
+    pass
+
+
 def _write_json_atomic(path, payload):
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
@@ -421,6 +427,7 @@ def _write_json_atomic(path, payload):
 def main():
     setup_default_logging()
     args, args_text = _parse_args()
+    orig_experiment = args.experiment
     # Pass args to the custom neuron module
     custom_neuron.set_global_args(args) # <--- Add this line
     triton_enabled = (os.environ.get('DISABLE_TRITON', '0') != '1')
@@ -433,29 +440,42 @@ def main():
     if args.log_wandb:
         if has_wandb:
             wandb_cfg = dict(**vars(args), triton_enabled=triton_enabled)
-            try:
-                wandb.init(
-                    project=args.dataset.split("/")[-1],
-                    name=args.experiment if args.experiment else None,
-                    config=wandb_cfg,
-                )
-                wandb_active = True
-            except Exception as exc:
-                _logger.warning(f"wandb online init failed ({exc}); falling back to offline mode.")
+            wandb_mode = os.environ.get("WANDB_MODE", "").strip().lower()
+            if wandb_mode == "offline":
                 try:
                     wandb.init(
                         project=args.dataset.split("/")[-1],
-                        name=args.experiment if args.experiment else None,
+                        name=orig_experiment if orig_experiment else None,
                         config=wandb_cfg,
                         mode="offline",
                     )
                     wandb_active = True
-                except Exception as exc2:
-                    _logger.warning(f"wandb offline init also failed ({exc2}); continuing without wandb.")
+                except Exception as exc:
+                    _logger.warning(f"wandb offline init failed ({exc}); continuing without wandb.")
+            else:
+                try:
+                    wandb.init(
+                        project=args.dataset.split("/")[-1],
+                        name=orig_experiment if orig_experiment else None,
+                        config=wandb_cfg,
+                    )
+                    wandb_active = True
+                except Exception as exc:
+                    _logger.warning(f"wandb online init failed ({exc}); falling back to offline mode.")
+                    try:
+                        wandb.init(
+                            project=args.dataset.split("/")[-1],
+                            name=orig_experiment if orig_experiment else None,
+                            config=wandb_cfg,
+                            mode="offline",
+                        )
+                        wandb_active = True
+                    except Exception as exc2:
+                        _logger.warning(f"wandb offline init also failed ({exc2}); continuing without wandb.")
             # Append unique Run ID to experiment name to prevent
             # multi-agent race conditions on checkpoint files
             if wandb_active and hasattr(wandb, 'run') and wandb.run is not None:
-                args.experiment = f"{args.experiment}_{wandb.run.id}"
+                args.experiment = f"{orig_experiment}_{wandb.run.id}"
         else:
             _logger.warning("You've requested to log metrics to wandb but package not found. "
                             "Metrics not being logged to wandb, try `pip install wandb`")
@@ -660,10 +680,11 @@ def main():
         interpolation=data_config['interpolation'],
         mean=data_config['mean'],
         std=data_config['std'],
-        num_workers=args.workers,
+        num_workers=0,
         distributed=args.distributed,
         crop_pct=data_config['crop_pct'],
         pin_memory=args.pin_mem,
+        persistent_workers=False,
     )
 
     # setup loss function
@@ -821,6 +842,10 @@ def main():
         run_status = "completed"
     except KeyboardInterrupt:
         run_status = "interrupted"
+    except _NaNCollapseError as exc:
+        run_error = f"{type(exc).__name__}: {exc}"
+        run_status = "nan_collapsed"
+        raise
     except Exception as exc:
         run_error = f"{type(exc).__name__}: {exc}"
         run_status = "failed"
@@ -839,7 +864,7 @@ def main():
             summary_payload = {
                 "status": run_status,
                 "error": run_error,
-                "experiment": args.experiment,
+                "experiment": orig_experiment,
                 "dataset": args.dataset,
                 "model": args.model,
                 "seed": args.seed,
@@ -857,10 +882,20 @@ def main():
             }
             _write_json_atomic(summary_path, summary_payload)
         if wandb_active:
+            old_alarm_handler = signal.getsignal(signal.SIGALRM)
+
+            def _wandb_finish_timeout(signum, frame):
+                raise TimeoutError("wandb.finish timed out")
+
             try:
+                signal.signal(signal.SIGALRM, _wandb_finish_timeout)
+                signal.alarm(60)
                 wandb.finish()
             except Exception as exc:
                 _logger.warning(f"wandb.finish failed: {exc}")
+            finally:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_alarm_handler)
 
     if best_metric is not None:
         _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
@@ -900,8 +935,12 @@ def train_one_epoch(
             output = model(input)
             loss = loss_fn(output, target)
 
+        loss_val = loss.item()
+        if not math.isfinite(loss_val):
+            raise _NaNCollapseError(f"Non-finite loss detected at epoch {epoch} batch {batch_idx}: {loss_val}")
+
         if not args.distributed:
-            losses_m.update(loss.item(), input.size(0))
+            losses_m.update(loss_val, input.size(0))
 
         optimizer.zero_grad()
         if loss_scaler is not None:

@@ -403,7 +403,7 @@ def main():
                 f"--epochs={cli.epochs}",
                 f"--workers={cli.workers}",
                 "--checkpoint-hist=1",
-                "--amp=True",
+                "--amp",
                 f"--seed={t['seed']}",
                 f"--experiment={t['exp_name']}",
                 f"--summary-json={t['summary_path']}",

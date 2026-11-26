@@ -31,23 +31,23 @@ def mean_sd(vals):
     return m, math.sqrt(var)
 
 
-def parse_arm_from_exp(exp_name):
-    """Strip c100_ prefix and _seedN suffix."""
-    body = exp_name[len("c100_"):] if exp_name.startswith("c100_") else exp_name
+def parse_arm_from_exp(exp_name, prefix="c100_"):
+    """Strip run prefix and _seedN suffix."""
+    body = exp_name[len(prefix):] if prefix and exp_name.startswith(prefix) else exp_name
     if "_seed" in body:
         return body.rsplit("_seed", 1)[0]
     return body
 
 
-def load_summaries(summary_dir):
+def load_summaries(summary_dir, prefix="c100_"):
     """Load completed/nan summaries indexed by {arm: {seed: rec}}."""
     by_arm = defaultdict(dict)
-    for path in sorted(glob.glob(os.path.join(summary_dir, "c100_*.json"))):
+    for path in sorted(glob.glob(os.path.join(summary_dir, f"{prefix}*.json"))):
         if path.endswith(".epochs.jsonl"):
             continue
         with open(path, "r", encoding="utf-8") as f:
             rec = json.load(f)
-        arm = parse_arm_from_exp(rec.get("experiment", os.path.basename(path)))
+        arm = parse_arm_from_exp(rec.get("experiment", os.path.basename(path)), prefix=prefix)
         by_arm[arm][rec.get("seed")] = rec
     return by_arm
 
@@ -78,7 +78,7 @@ def paired_delta(by_arm, lhs, rhs):
     return len(d_last), m_d, se_d, ci, m_dm, wins
 
 
-def render_report(by_arm):
+def render_report(by_arm, time_step=4):
     """Render Markdown summary report."""
     def rank_key(arm):
         ok = [r for r in by_arm[arm].values() if r.get("status") == "completed"]
@@ -86,7 +86,7 @@ def render_report(by_arm):
 
     ordered = sorted(by_arm.keys(), key=rank_key)
     lines = [
-        "# Stage 2 CIFAR-100 MaxFormer Results (`T=4`, `400+10` Epochs)",
+        f"# Stage 2 CIFAR-100 MaxFormer Results (`T={time_step}`, `400+10` Epochs)",
         "",
         "## Per-Arm Summary (Ranked by `val/mean_last10`)",
         "",
@@ -150,14 +150,16 @@ def render_report(by_arm):
 def main():
     parser = argparse.ArgumentParser(description="Summarize Stage 2 CIFAR-100 evaluation results")
     parser.add_argument("--summary-dir", default="cifar10-100/logs/stage2_cifar100/summaries")
+    parser.add_argument("--prefix", default="c100_")
+    parser.add_argument("--time-step", type=int, default=4)
     parser.add_argument("--write-md", default="")
     args = parser.parse_args()
 
-    by_arm = load_summaries(args.summary_dir)
+    by_arm = load_summaries(args.summary_dir, prefix=args.prefix)
     if not by_arm:
         print(f"No CIFAR-100 summaries found in {args.summary_dir}")
         return
-    report = render_report(by_arm)
+    report = render_report(by_arm, time_step=args.time_step)
     print(report)
     if args.write_md:
         parent = os.path.dirname(os.path.abspath(args.write_md))

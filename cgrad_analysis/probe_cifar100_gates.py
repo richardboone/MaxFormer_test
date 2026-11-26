@@ -107,12 +107,12 @@ PROBE_ARMS = [
 ]
 
 
-def parse_arm_args(arm):
+def parse_arm_args(arm, time_step=4):
     """Parse cifar10-100/train.py arguments for one probe arm."""
     cfg_path = os.path.join(CIFAR_DIR, arm["config"].lstrip("./"))
     orig_argv = sys.argv
     try:
-        sys.argv = ["train.py", "-c", cfg_path] + list(arm["flags"])
+        sys.argv = ["train.py", "-c", cfg_path, f"--time-step={time_step}"] + list(arm["flags"])
         args, _ = c100_train._parse_args()
         return args
     finally:
@@ -168,6 +168,7 @@ def main():
     parser.add_argument("--data-path", default="/data/rboone/datasets/cifar100/")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--time-step", type=int, default=4)
     parser.add_argument("--synthetic", action="store_true")
     cli = parser.parse_args()
 
@@ -182,7 +183,7 @@ def main():
     y = y.to(device)
     criterion = nn.CrossEntropyLoss()
 
-    base_args = parse_arm_args(PROBE_ARMS[0])
+    base_args = parse_arm_args(PROBE_ARMS[0], time_step=cli.time_step)
     custom_neuron.set_global_args(base_args)
     model = create_model(
         "max_former",
@@ -192,7 +193,7 @@ def main():
         mlp_ratios=4,
         drop_rate=0.0,
         depths=4,
-        T=4,
+        T=cli.time_step,
     ).to(device)
     model.train()
     init_state = copy.deepcopy(model.state_dict())
@@ -203,7 +204,7 @@ def main():
 
     bad_arms = []
     for arm in PROBE_ARMS:
-        args = parse_arm_args(arm)
+        args = parse_arm_args(arm, time_step=cli.time_step)
         custom_neuron.set_global_args(args)
         model.load_state_dict(init_state)
         functional.reset_net(model)
@@ -233,10 +234,10 @@ def main():
         )
 
     if bad_arms:
-        print(f"\n[PROBE FAIL] {len(bad_arms)} non-reference arms failed calibration: {bad_arms}")
+        print(f"\n[PROBE FAIL] {len(bad_arms)} non-reference arms failed T={cli.time_step} calibration: {bad_arms}")
         sys.exit(2)
     n_checked = sum(1 for a in PROBE_ARMS if not a.get("is_ref"))
-    print(f"\n[PROBE PASS] All {n_checked} Stage 2 CIFAR-100 C-Grad arms passed T=4 gate calibration.")
+    print(f"\n[PROBE PASS] All {n_checked} Stage 2 CIFAR-100 C-Grad arms passed T={cli.time_step} gate calibration.")
 
 
 if __name__ == "__main__":

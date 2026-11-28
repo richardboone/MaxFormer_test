@@ -174,6 +174,10 @@ def parse_args():
     parser.add_argument('--snnbp-decay', type=float, default=0.5, help='adaptive_cgrad: trust decay for large base gradients')
     parser.add_argument('--snnbp-intervention', type=float, default=None, help='confidence threshold h for intervention')
     parser.add_argument('--snnbp-eta', type=float, default=None, help='correction strength eta (0.0 recovers plain BPTT)')
+    parser.add_argument('--snnbp-eta-end', type=float, default=None,
+                        help='final snnbp_eta for cosine decay over total epochs (None disables decay)')
+    parser.add_argument('--snnbp-eta-warmup-epochs', type=int, default=0,
+                        help='linear warmup epochs for snnbp_eta from 0 to --snnbp-eta')
     parser.add_argument('--snnbp-blend', type=float, default=0.5, help='conservative_cgrad: blend scale factor')
     parser.add_argument('--snnbp-norm', type=str, default=None, choices=['local', 'rms', 'none'], help='improved_cgrad: normalization mode')
     parser.add_argument('--snnbp-harmful-only', type=str2bool, default=None, help='improved_cgrad: gate only on m_eff > 0 instead of |m_eff|')
@@ -627,8 +631,23 @@ def main(args):
 
     patience_counter = 0 # for early stopping
     print(f"Early stopping enabled. Patience: {args.early_stop_patience} epochs.")
+    base_snnbp_eta = args.snnbp_eta
+    eta_warmup = max(0, int(getattr(args, 'snnbp_eta_warmup_epochs', 0) or 0))
+    eta_end = getattr(args, 'snnbp_eta_end', None)
     try:
         for epoch in range(args.start_epoch, num_epochs):
+            if base_snnbp_eta is not None:
+                if eta_warmup > 0 and epoch < eta_warmup:
+                    current_eta = float(base_snnbp_eta) * (epoch / float(eta_warmup))
+                elif eta_end is not None:
+                    denom = float(max(1, num_epochs - 1 - eta_warmup))
+                    progress = min(1.0, max(0.0, (epoch - eta_warmup) / denom))
+                    current_eta = float(eta_end) + 0.5 * (float(base_snnbp_eta) - float(eta_end)) * (
+                        1.0 + math.cos(math.pi * progress)
+                    )
+                else:
+                    current_eta = float(base_snnbp_eta)
+                args.snnbp_eta = current_eta
             save_max = False
             if args.distributed:
                 train_sampler.set_epoch(epoch)
@@ -675,6 +694,8 @@ def main(args):
                 f"val/mean_last{k}": val_mean_last_k,
                 "lr": float(optimizer.param_groups[0]['lr']),
             }
+            if args.snnbp_eta is not None:
+                log_payload["cgrad/eta"] = float(args.snnbp_eta)
             if cgrad_stats is not None:
                 log_payload.update(cgrad_stats)
 
@@ -727,6 +748,8 @@ def main(args):
         run_status = "nan_collapsed" if "loss is Nan" in str(exc) else "failed"
         raise
     finally:
+        final_snnbp_eta = args.snnbp_eta
+        args.snnbp_eta = base_snnbp_eta
         if summary_path and utils.is_main_process():
             cgrad_stats_mean = {}
             if cgrad_stats_history:
@@ -752,6 +775,7 @@ def main(args):
                 "val_mean_last_k": float(val_mean_last_k),
                 f"val_mean_last{args.metric_window}": float(val_mean_last_k),
                 "final_val_acc1": float(final_test_acc1),
+                "snnbp_eta_final": float(final_snnbp_eta) if final_snnbp_eta is not None else None,
                 "mean_epoch_time_sec": float(sum(epoch_times) / len(epoch_times)) if epoch_times else 0.0,
                 "cgrad_stats_mean": cgrad_stats_mean,
                 "args": vars(args),
